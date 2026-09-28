@@ -1,0 +1,36 @@
+# Frontend dependencies and generated files
+/ui/node_modules/
+/ui/dist/
+/ui/.svelte-kit/
+/ui/coverage/
+
+# Local application data and downloaded Whisper assets
+/server/data/
+/inbox/
+/whisper/
+
+# Local Go binaries and test output
+/server/meet-to-md
+/server/meet-to-md.exe
+/server/modelprobe
+/server/modelprobe.exe
+/server/*.test
+/server/*.test.exe
+/server/coverage.out
+
+# Machine-specific settings and logs
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+*.log
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
