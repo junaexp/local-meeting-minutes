@@ -23,7 +23,7 @@ type Config struct {
 }
 
 func Default() Config {
-	return Config{Listen: "127.0.0.1:8791", CodexBinary: "codex", WhisperModel: "base", FFmpegBinary: "ffmpeg"}
+	return Config{Listen: "127.0.0.1:8791", CodexBinary: "codex", WhisperModel: "large-v3-turbo", FFmpegBinary: "ffmpeg"}
 }
 
 func Load(path string) (Config, error) {
@@ -41,8 +41,8 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Prompt) == "" {
 		return errors.New("prompt must not be empty")
 	}
-	if c.WhisperModel != "base" && c.WhisperModel != "small" {
-		return errors.New("whisper_model must be base or small")
+	if c.WhisperModel != "base" && c.WhisperModel != "small" && c.WhisperModel != "large-v3-turbo" {
+		return errors.New("whisper_model must be base, small, or large-v3-turbo")
 	}
 	if c.OutputDir != "" {
 		if !filepath.IsAbs(c.OutputDir) {

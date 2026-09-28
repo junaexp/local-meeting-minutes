@@ -17,6 +17,13 @@ import (
 
 const whisperVersion = "v1.8.3"
 
+func whisperInstallerVersion() string {
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		return "b5130"
+	}
+	return whisperVersion
+}
+
 func (s *Service) whisperBinary() string {
 	base := filepath.Join(s.root, "whisper")
 	if runtime.GOOS == "windows" {
@@ -79,7 +86,11 @@ func (s *Service) installWhisper(ctx context.Context) error {
 	}
 	if info, err := os.Stat(modelPath); err != nil || info.Size() < 1000000 {
 		url := "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-" + model + ".bin"
-		if err := download(ctx, url, modelPath, 600*1024*1024); err != nil {
+		maxBytes := int64(600 * 1024 * 1024)
+		if model == "large-v3-turbo" {
+			maxBytes = 2 * 1024 * 1024 * 1024
+		}
+		if err := download(ctx, url, modelPath, maxBytes); err != nil {
 			return fmt.Errorf("Whisper 모델 다운로드: %w", err)
 		}
 	}
@@ -205,10 +216,9 @@ func extractZip(archive, dest string, stripRoot bool) error {
 }
 func installWindowsWhisper(ctx context.Context, base string) error {
 	asset := "whisper-bin-x64.zip"
-	tag := whisperVersion
+	tag := whisperInstallerVersion()
 	if runtime.GOARCH == "arm64" {
 		asset = "whisper-bin-win-cpu-arm64.zip"
-		tag = "b5130"
 	} else if runtime.GOARCH != "amd64" {
 		return errors.New("이 Windows CPU 아키텍처는 지원하지 않습니다")
 	}

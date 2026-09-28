@@ -4,7 +4,7 @@ import App from './App.svelte'
 import { api, type Snapshot } from '$lib/api'
 
 vi.mock('$lib/api', () => ({ api: {
-  state: vi.fn(), config: vi.fn(), models: vi.fn(), browse: vi.fn(), expand: vi.fn(), preview: vi.fn(),
+  state: vi.fn(), config: vi.fn(), environment: vi.fn(), models: vi.fn(), browse: vi.fn(), expand: vi.fn(), preview: vi.fn(),
   importFiles: vi.fn(), createJobs: vi.fn(), saveConfig: vi.fn(), testCodex: vi.fn(), installWhisper: vi.fn(),
   deleteJob: vi.fn(), cancelJob: vi.fn(),
 } }))
@@ -25,7 +25,12 @@ beforeEach(() => {
   vi.stubGlobal('EventSource', FakeEventSource)
   vi.spyOn(window, 'confirm').mockReturnValue(true)
   vi.mocked(api.state).mockResolvedValue(baseState)
-  vi.mocked(api.config).mockResolvedValue({ listen: '127.0.0.1:8791', codexBinary: 'codex', outputDir: '', whisperModel: 'base', ffmpegBinary: 'ffmpeg', prompt: '한국어로 회의록 작성' })
+  vi.mocked(api.config).mockResolvedValue({ listen: '127.0.0.1:8791', codexBinary: 'codex', outputDir: '', whisperModel: 'large-v3-turbo', ffmpegBinary: 'ffmpeg', prompt: '한국어로 회의록 작성' })
+  vi.mocked(api.environment).mockResolvedValue({
+    codex: { path: '/usr/local/bin/codex', ready: true },
+    whisper: { model: 'large-v3-turbo', modelPath: '/tmp/whisper/models/ggml-large-v3-turbo.bin', modelReady: false, binaryPath: '', binaryReady: false, installerVersion: 'v1.8.3' },
+    ffmpeg: { path: '/usr/local/bin/ffmpeg', ready: true, version: '8.0' },
+  })
   vi.mocked(api.models).mockResolvedValue({ models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', supportedReasoningEfforts: ['low','medium','high','xhigh'].map(reasoningEffort => ({ reasoningEffort })) }] })
   vi.mocked(api.browse).mockResolvedValue({ path: '/tmp/회의', parent: '/tmp', entries: [{ name: 'a.srt', path: '/tmp/회의/a.srt', isDir: false, size: 12 }, { name: 'b.vtt', path: '/tmp/회의/b.vtt', isDir: false, size: 12 }] })
   vi.mocked(api.expand).mockResolvedValue({ paths: ['/tmp/회의/a.srt', '/tmp/회의/b.vtt'] })
@@ -54,6 +59,8 @@ describe('workspace flow', () => {
     await screen.findByDisplayValue('한국어로 회의록 작성')
     await fireEvent.click(screen.getByRole('button', { name: '설정 열기' }))
     await screen.findByRole('dialog')
+    expect(await screen.findByText('/tmp/whisper/models/ggml-large-v3-turbo.bin')).toBeTruthy()
+    expect(screen.getByText('설치된 버전: 8.0')).toBeTruthy()
     await fireEvent.click(screen.getByRole('button', { name: 'GPT-5.6 Luna로 테스트' }))
     await waitFor(() => expect(api.testCodex).toHaveBeenCalledWith('gpt-5.6-luna'))
     expect(await screen.findByText('모델 응답: Hello world!')).toBeTruthy()

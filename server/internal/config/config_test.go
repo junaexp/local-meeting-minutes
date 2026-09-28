@@ -11,6 +11,9 @@ func TestLoadSaveAndValidation(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "config.toml")
 	c := Default()
+	if c.WhisperModel != "large-v3-turbo" {
+		t.Fatalf("unexpected default Whisper model: %q", c.WhisperModel)
+	}
 	c.Prompt = "한국어 회의록\n원문만 사용"
 	if err := Save(path, c); err != nil {
 		t.Fatal(err)
@@ -37,6 +40,11 @@ func TestLoadSaveAndValidation(t *testing.T) {
 	c.OutputDir = "relative"
 	if err := c.Validate(); err == nil {
 		t.Fatal("relative output dir accepted")
+	}
+	c.OutputDir = ""
+	c.WhisperModel = "unknown"
+	if err := c.Validate(); err == nil {
+		t.Fatal("unknown Whisper model accepted")
 	}
 }
 

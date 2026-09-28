@@ -6,6 +6,12 @@ export interface Job {
 }
 export interface Snapshot { jobs: Job[]; codexReady: boolean; whisperReady: boolean; whisperInstalling: boolean; whisperError: string }
 export interface Config { listen: string; codexBinary: string; outputDir: string; whisperModel: string; ffmpegBinary: string; prompt: string }
+export interface BinaryEnvironment { path: string; ready: boolean; version?: string; error?: string }
+export interface Environment {
+  codex: BinaryEnvironment
+  whisper: { model: string; modelPath: string; modelReady: boolean; binaryPath: string; binaryReady: boolean; installerVersion: string }
+  ffmpeg: BinaryEnvironment
+}
 export interface Entry { name: string; path: string; isDir: boolean; size: number }
 export interface BrowseResult { path: string; parent: string; entries: Entry[] }
 export interface Model { id: string; model: string; displayName: string; supportedReasoningEfforts: { reasoningEffort: string }[] }
@@ -25,6 +31,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 export const api = {
   state: () => request<Snapshot>('/state'),
   config: () => request<Config>('/config'),
+  environment: () => request<Environment>('/environment'),
   saveConfig: (value: Config) => request<Config>('/config', { method: 'PUT', body: JSON.stringify(value) }),
   browse: (path = '') => request<BrowseResult>(`/browse?path=${encodeURIComponent(path)}`),
   expand: (paths: string[]) => request<{ paths: string[] }>('/expand', { method: 'POST', body: JSON.stringify({ paths }) }),

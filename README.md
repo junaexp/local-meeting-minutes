@@ -43,7 +43,7 @@ Windows PowerShell에서도 각 폴더로 이동해 같은 `npm`/`go` 명령을 
 | `prompt` | 파일 하나에서 회의록 Markdown 하나를 만드는 지시문 |
 | `codex_binary` | Codex CLI 명령 또는 실행 파일 절대경로. 기본 `codex` |
 | `output_dir` | 비우면 입력 파일과 같은 폴더 |
-| `whisper_model` | `base` 또는 `small` 다국어 모델 |
+| `whisper_model` | 기본값 `large-v3-turbo`(약 1.5GiB). `base`, `small`도 선택 가능 |
 | `ffmpeg_binary` | ffmpeg 명령 또는 실행 파일 경로 |
 
 `설정 > 실제 응답 테스트`는 `gpt-5.6-luna`에 `Hello world!`를 보내므로 모델 사용량이 발생할 수 있습니다. Whisper 설치 버튼은 모델을 `whisper/models/`에 받고 실행 파일을 `whisper/` 안에 준비합니다. 모델은 Hugging Face의 whisper.cpp 배포본, 실행 파일/소스는 [공식 whisper.cpp](https://github.com/ggml-org/whisper.cpp)를 사용합니다.

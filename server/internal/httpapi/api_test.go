@@ -69,6 +69,31 @@ func TestEmptyStateUsesArray(t *testing.T) {
 	}
 }
 
+func TestEnvironmentReportsWhisperModelPath(t *testing.T) {
+	h, root := testAPI(t)
+	got := serve(h, "GET", "/api/environment", nil, nil)
+	if got.Code != http.StatusOK {
+		t.Fatalf("environment: %d %s", got.Code, got.Body.String())
+	}
+	var environment struct {
+		Whisper struct {
+			Model      string `json:"model"`
+			ModelPath  string `json:"modelPath"`
+			ModelReady bool   `json:"modelReady"`
+		} `json:"whisper"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &environment); err != nil {
+		t.Fatal(err)
+	}
+	if environment.Whisper.Model != "large-v3-turbo" || environment.Whisper.ModelReady {
+		t.Fatalf("unexpected Whisper status: %+v", environment.Whisper)
+	}
+	want := filepath.Join(root, "whisper", "models", "ggml-large-v3-turbo.bin")
+	if environment.Whisper.ModelPath != want {
+		t.Fatalf("model path: got %q, want %q", environment.Whisper.ModelPath, want)
+	}
+}
+
 func TestLocalBoundaryAndFileFlow(t *testing.T) {
 	h, root := testAPI(t)
 	file := filepath.Join(root, "meeting.srt")

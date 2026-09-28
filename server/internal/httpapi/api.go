@@ -32,6 +32,7 @@ func (a API) Router() http.Handler {
 		r.Get("/state", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Snapshot()) })
 		r.Get("/events", a.events)
 		r.Get("/config", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Config()) })
+		r.Get("/environment", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Environment()) })
 		r.Put("/config", a.updateConfig)
 		r.Get("/browse", a.browse)
 		r.Post("/expand", a.expand)

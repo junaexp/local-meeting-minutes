@@ -5,7 +5,7 @@
   import { Textarea } from '$lib/components/ui/textarea/index.js'
   import { NativeSelect } from '$lib/components/ui/native-select/index.js'
   import * as Dialog from '$lib/components/ui/dialog/index.js'
-  import { api, type BrowseResult, type Config, type Job, type Model, type Snapshot } from '$lib/api'
+  import { api, type BrowseResult, type Config, type Environment, type Job, type Model, type Snapshot } from '$lib/api'
   import { addPaths, moveFile, removeFile, type CartFile } from '$lib/cart'
 
   let state: Snapshot = { jobs: [], codexReady: false, whisperReady: false, whisperInstalling: false, whisperError: '' }
@@ -29,6 +29,9 @@
   let detailId = ''
   let promptEditing = false
   let settingsDraft: Config | null = null
+  let environment: Environment | null = null
+  let environmentLoading = false
+  let environmentError = ''
   let testLog = ''
   let testRunning = false
   let testResult = ''
@@ -52,11 +55,13 @@
 
   function acceptState(next: Snapshot) {
     next = { ...next, jobs: next.jobs ?? [] }
+    const whisperChanged = state.whisperReady !== next.whisperReady || (state.whisperInstalling && !next.whisperInstalling)
     if (notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
       for (const job of next.jobs) if (job.status === 'completed' && !knownCompleted.has(job.id)) new Notification('회의록 생성 완료', { body: `${job.name} · 저장 완료` })
     }
     knownCompleted = new Set(next.jobs.filter(job => job.status === 'completed').map(job => job.id))
     state = next
+    if (settingsOpen && whisperChanged) void refreshEnvironment()
   }
   onMount(() => {
     Promise.all([api.state(), api.config()]).then(([next, cfg]) => {
@@ -99,7 +104,13 @@
     try { await api.createJobs(cart.map(file => file.path), model, effort); cart = []; selectedPath = ''; preview = '파일을 선택하면 여기에 원문을 표시합니다.' }
     catch (err) { error = (err as Error).message } finally { busy = false }
   }
-  function openSettings() { settingsDraft = config ? { ...config } : null; testLog = ''; testResult = ''; settingsOpen = true }
+  async function refreshEnvironment() {
+    environmentLoading = true; environmentError = ''
+    try { environment = await api.environment() }
+    catch (err) { environmentError = (err as Error).message }
+    finally { environmentLoading = false }
+  }
+  function openSettings() { settingsDraft = config ? { ...config } : null; testLog = ''; testResult = ''; environment = null; settingsOpen = true; void refreshEnvironment() }
   async function saveSettings() {
     if (!settingsDraft) return; busy = true; error = ''
     try { config = await api.saveConfig(settingsDraft); promptValue = config.prompt; settingsOpen = false; await loadModels() }
@@ -166,14 +177,40 @@
   {#if browserBusy}<p class="muted compact">불러오는 중...</p>{/if}
 </Dialog.Content></Dialog.Root>
 
-<Dialog.Root bind:open={settingsOpen}><Dialog.Content class="!max-w-[700px] max-h-[90vh] overflow-auto"><Dialog.Header><Dialog.Title>설정</Dialog.Title><Dialog.Description>Codex 연결과 회의록 저장 위치를 설정합니다.</Dialog.Description></Dialog.Header>
-  {#if settingsDraft}<div class="success">{state.codexReady ? 'Codex 실행 파일을 찾았습니다.' : 'Codex 실행 파일을 찾지 못했습니다. 경로를 확인해 주세요.'}</div>
-    <label class="field-label" for="codex-path">Codex 실행 파일</label><Input id="codex-path" bind:value={settingsDraft.codexBinary} placeholder="codex 또는 실행 파일 절대경로" /><p class="tiny muted">PATH에서 자동 탐색합니다. 필요하면 실행 파일 경로를 직접 지정하세요.</p>
-    <label class="field-label" for="output-dir">회의록 저장 폴더</label><Input id="output-dir" bind:value={settingsDraft.outputDir} placeholder="비워두면 원본 파일과 같은 폴더" />
-    <label class="field-label" for="whisper-model">Whisper 모델</label><NativeSelect id="whisper-model" bind:value={settingsDraft.whisperModel}><option value="base">Base · 다국어</option><option value="small">Small · 다국어</option></NativeSelect>
-    <label class="field-label" for="ffmpeg-path">ffmpeg 실행 파일</label><Input id="ffmpeg-path" bind:value={settingsDraft.ffmpegBinary} />
-    <div class="modal-section"><div class="section-top"><h3 class="section-title">실제 응답 테스트</h3><Button size="sm" disabled={testRunning} onclick={testCodex}>{testRunning ? '테스트 중' : 'GPT-5.6 Luna로 테스트'}</Button></div><p class="tiny muted">Hello world!를 보내 실제 응답을 확인합니다. 모델 사용량이 발생할 수 있습니다.</p><div class="log-box" role="log" aria-live="polite">{testLog || '테스트를 실행하면 로그가 여기에 표시됩니다.'}</div>{#if testResult}<div class="success" style="margin-top:8px">모델 응답: {testResult}</div>{/if}</div>
-    <Dialog.Footer><Button variant="outline" onclick={() => settingsOpen = false}>취소</Button><Button disabled={busy} onclick={saveSettings}>설정 저장</Button></Dialog.Footer>
+<Dialog.Root bind:open={settingsOpen}><Dialog.Content class="settings-dialog !max-w-[900px] w-[calc(100vw-2rem)] max-h-[90vh] overflow-auto"><Dialog.Header><Dialog.Title>설정</Dialog.Title></Dialog.Header>
+  {#if settingsDraft}
+    <div class="settings-heading"><h3>실행 환경</h3><Button variant="outline" size="xs" disabled={environmentLoading} onclick={refreshEnvironment}>{environmentLoading ? '확인 중' : '재검색'}</Button></div>
+    {#if environmentError}<div class="error" role="alert">환경 정보를 읽지 못했습니다: {environmentError}</div>{/if}
+    <div class="settings-fields">
+      <div class="settings-field">
+        <div class="settings-field-head"><label class="field-label" for="codex-path">Codex 실행 파일</label><span class="env-status" class:ready={environment?.codex.ready}>{environmentLoading ? '확인 중' : environment?.codex.ready ? '탐색됨' : '확인 필요'}</span></div>
+        <Input id="codex-path" bind:value={settingsDraft.codexBinary} placeholder="codex 또는 실행 파일 절대경로" />
+        <p class="settings-hint">PATH에서 자동 탐색합니다. 경로를 직접 지정할 수도 있습니다.</p>
+        <div class="resolved-info"><span>현재 경로</span><code>{environment?.codex.path || environment?.codex.error || '확인 중'}</code></div>
+      </div>
+      <div class="settings-field">
+        <label class="field-label" for="output-dir">회의록 저장 폴더</label>
+        <Input id="output-dir" bind:value={settingsDraft.outputDir} placeholder="비워두면 원본 파일과 같은 폴더" />
+        <p class="settings-hint">비워두면 각 원본 파일 옆에 회의록을 저장합니다.</p>
+      </div>
+    </div>
+    <div class="settings-fields settings-tools">
+      <div class="settings-field tool-card">
+        <div class="settings-field-head"><label class="field-label" for="whisper-model">Whisper 모델</label><span class="env-status" class:ready={environment?.whisper.model === settingsDraft.whisperModel && environment?.whisper.modelReady && environment?.whisper.binaryReady}>{environmentLoading ? '확인 중' : !environment ? '확인 필요' : environment.whisper.model !== settingsDraft.whisperModel ? '저장 후 확인' : environment.whisper.modelReady && environment.whisper.binaryReady ? '준비됨' : '설치 필요'}</span></div>
+        <NativeSelect class="w-full" id="whisper-model" bind:value={settingsDraft.whisperModel}><option value="large-v3-turbo">Large V3 Turbo · 다국어</option><option value="base">Base · 다국어</option><option value="small">Small · 다국어</option></NativeSelect>
+        {#if environment && environment.whisper.model !== settingsDraft.whisperModel}<p class="settings-hint">모델 변경은 설정 저장 후 적용됩니다. 현재 적용: {environment.whisper.model}</p>{:else}<p class="settings-hint">현재 적용: {environment?.whisper.model || '확인 중'} · 자동 설치 기준 whisper.cpp {environment?.whisper.installerVersion || '확인 중'}</p>{/if}
+        <div class="resolved-info"><span>모델 파일</span><code>{environment?.whisper.modelPath || '확인 중'}</code></div>
+        <div class="resolved-info"><span>Whisper 실행 파일</span><code>{environment?.whisper.binaryPath || '미설치'}</code></div>
+      </div>
+      <div class="settings-field tool-card">
+        <div class="settings-field-head"><label class="field-label" for="ffmpeg-path">ffmpeg 실행 파일</label><span class="env-status" class:ready={environment?.ffmpeg.ready}>{environmentLoading ? '확인 중' : environment?.ffmpeg.ready ? '탐색됨' : '확인 필요'}</span></div>
+        <Input id="ffmpeg-path" bind:value={settingsDraft.ffmpegBinary} placeholder="ffmpeg 또는 실행 파일 절대경로" />
+        <p class="settings-hint">설치된 버전: {environment?.ffmpeg.version || environment?.ffmpeg.error || '확인 중'}</p>
+        <div class="resolved-info"><span>현재 경로</span><code>{environment?.ffmpeg.path || '찾지 못했습니다'}</code></div>
+      </div>
+    </div>
+    <div class="settings-test"><div class="settings-field-head"><h3>실제 응답 테스트</h3><Button size="sm" disabled={testRunning} onclick={testCodex}>{testRunning ? '테스트 중' : 'GPT-5.6 Luna로 테스트'}</Button></div><p class="settings-hint">Hello world!를 보내 실제 응답을 확인합니다. 모델 사용량이 발생할 수 있습니다.</p><div class="log-box" role="log" aria-live="polite">{testLog || '테스트를 실행하면 로그가 여기에 표시됩니다.'}</div>{#if testResult}<div class="success" style="margin-top:8px">모델 응답: {testResult}</div>{/if}</div>
+    <Dialog.Footer class="settings-footer"><Button variant="outline" onclick={() => settingsOpen = false}>취소</Button><Button disabled={busy} onclick={saveSettings}>설정 저장</Button></Dialog.Footer>
   {/if}
 </Dialog.Content></Dialog.Root>
 
