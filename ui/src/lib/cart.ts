@@ -1,4 +1,4 @@
-export interface CartFile { path: string; name: string }
+export interface CartFile { path: string; name: string; disabled?: boolean; sourcePath?: string }
 export function addPaths(existing: CartFile[], paths: string[]): CartFile[] {
   const seen = new Set(existing.map(item => item.path))
   const result = [...existing]
@@ -17,3 +17,15 @@ export function moveFile(files: CartFile[], from: number, to: number): CartFile[
   return next
 }
 export function removeFile(files: CartFile[], path: string): CartFile[] { return files.filter(file => file.path !== path) }
+
+export function attachTranscript(files: CartFile[], sourcePath: string, transcriptPath: string): CartFile[] {
+  const source = files.find(file => file.path === sourcePath && !file.sourcePath)
+  if (!source || !transcriptPath) return files
+  const existing = files.find(file => file.sourcePath === sourcePath)
+  if (source.disabled && existing?.path === transcriptPath) return files
+  const next = files.filter(file => file.sourcePath !== sourcePath && file.path !== transcriptPath)
+  const index = next.findIndex(file => file.path === sourcePath)
+  next[index] = { ...next[index], disabled: true }
+  next.splice(index + 1, 0, { path: transcriptPath, name: transcriptPath.split(/[\\/]/).pop() || transcriptPath, sourcePath })
+  return next
+}

@@ -6,7 +6,7 @@ import { api, type Job, type Snapshot } from '$lib/api'
 vi.mock('$lib/api', () => ({ api: {
   state: vi.fn(), config: vi.fn(), environment: vi.fn(), models: vi.fn(), browse: vi.fn(), expand: vi.fn(), preview: vi.fn(),
   importFiles: vi.fn(), createJobs: vi.fn(), createTranscription: vi.fn(), saveConfig: vi.fn(), testCodex: vi.fn(), installWhisper: vi.fn(),
-  deleteJob: vi.fn(), cancelJob: vi.fn(), jobTranscript: vi.fn(),
+  deleteJob: vi.fn(), deleteFinishedJobs: vi.fn(), cancelJob: vi.fn(), job: vi.fn(), jobTranscript: vi.fn(),
 } }))
 
 class FakeEventSource {
@@ -23,6 +23,7 @@ class FakeEventSource {
 
 const baseState: Snapshot = { jobs: [], codexReady: true, whisperReady: false, whisperInstalling: false, whisperError: '' }
 beforeEach(() => {
+  window.localStorage.clear()
   vi.stubGlobal('EventSource', FakeEventSource)
   vi.spyOn(window, 'confirm').mockReturnValue(true)
   vi.mocked(api.state).mockResolvedValue(baseState)
@@ -40,6 +41,7 @@ beforeEach(() => {
   vi.mocked(api.createJobs).mockResolvedValue({ jobs: [] })
   vi.mocked(api.testCodex).mockResolvedValue({ result: 'Hello world!', models: [] })
   vi.mocked(api.installWhisper).mockResolvedValue({ status: 'installing' })
+  vi.mocked(api.deleteFinishedJobs).mockResolvedValue({ deleted: 0, state: baseState })
 })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
@@ -190,6 +192,16 @@ describe('workspace flow', () => {
     expect(await screen.findByText(/SRT 저장 위치: \/tmp\/회의\/meeting_전사.srt/)).toBeTruthy()
     expect(screen.getByText('Codex 실행 파일을 찾을 수 없습니다')).toBeTruthy()
   })
+  it('loads long output only when a completed job detail is opened', async () => {
+    const slim = { ...transcriptionJob('completed'), transcriptionLog: '', transcriptPath: '/tmp/회의/recover_전사.srt' }
+    vi.mocked(api.job).mockResolvedValue({ ...slim, transcriptionLog: 'Whisper 상세 로그' })
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: [slim] })
+    await fireEvent.click(await screen.findByRole('button', { name: /recover.mp4/ }))
+    await waitFor(() => expect(api.job).toHaveBeenCalledWith(slim.id))
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Whisper 전사 로그' }) as HTMLTextAreaElement).value).toBe('Whisper 상세 로그'))
+  })
   it('starts media transcription and shows file-specific live output', async () => {
     const media = '/tmp/회의/제품회의.mp4'
     const job: Job = {
@@ -216,6 +228,89 @@ describe('workspace flow', () => {
     await fireEvent.click(document.querySelector('.job-card') as HTMLButtonElement)
     await waitFor(() => expect(api.jobTranscript).toHaveBeenCalledWith(job.id))
     expect((screen.getByRole('textbox', { name: '전사문' }) as HTMLTextAreaElement).value).toContain('00:00:01,000')
+  })
+  it('adds the exported SRT after its disabled source and submits only active files', async () => {
+    const media = '/tmp/회의/meeting.mp4'
+    const srt = '/tmp/회의/meeting_전사.srt'
+    const job = { ...transcriptionJob('running'), path: media, name: 'meeting.mp4', id: 'export-1' }
+    vi.mocked(api.state).mockResolvedValue({ ...baseState, whisperReady: true })
+    vi.mocked(api.expand).mockResolvedValue({ paths: [media] })
+    vi.mocked(api.preview).mockResolvedValue({ text: '전사문', transcribed: true })
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '폴더 선택' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '현재 폴더 추가' }))
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [job] })
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [{ ...job, status: 'completed', stage: 'completed', phase: '전사 완료', transcriptPath: srt }] })
+    expect(await screen.findByTitle(srt)).toBeTruthy()
+    expect(screen.getByTitle(media).closest('.cart-item')?.classList.contains('disabled')).toBe(true)
+    expect(screen.getByText('전사 완료 · 회의록 처리 제외')).toBeTruthy()
+    expect(screen.getByText('1개 파일')).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: '회의록 정리 시작' }))
+    await waitFor(() => expect(api.createJobs).toHaveBeenCalledWith([srt], 'gpt-5.6-sol', 'medium'))
+  })
+  it('restores the processing list after a reload and attaches a finished transcript', async () => {
+    const media = '/tmp/회의/reloaded.mp4'
+    const srt = '/tmp/회의/reloaded_전사.srt'
+    window.localStorage.setItem('meet-to-md-cart-v1', JSON.stringify([{ path: media, name: 'reloaded.mp4' }]))
+    vi.mocked(api.state).mockResolvedValue({ ...baseState, whisperReady: true, jobs: [{ ...transcriptionJob('completed'), path: media, name: 'reloaded.mp4', transcriptPath: srt }] })
+    render(App)
+    expect(await screen.findByTitle(srt)).toBeTruthy()
+    expect(screen.getByTitle(media).closest('.cart-item')?.classList.contains('disabled')).toBe(true)
+    expect(JSON.parse(window.localStorage.getItem('meet-to-md-cart-v1') || '[]')).toHaveLength(2)
+  })
+  it('pins transcript and Whisper log independently and lets the user pause scrolling', async () => {
+    const media = '/tmp/회의/scroll.mp4'
+    const job = { ...transcriptionJob('running', '첫 로그'), path: media, name: 'scroll.mp4', transcriptPreview: '첫 문장' }
+    vi.mocked(api.state).mockResolvedValue({ ...baseState, whisperReady: true })
+    vi.mocked(api.expand).mockResolvedValue({ paths: [media] })
+    vi.mocked(api.preview).mockResolvedValue({ text: '전사 중', transcribed: false })
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '폴더 선택' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '현재 폴더 추가' }))
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [job] })
+    await waitFor(() => expect((screen.getByRole('textbox', { name: '전사문 미리보기' }) as HTMLTextAreaElement).value).toBe('첫 문장'))
+    const preview = screen.getByRole('textbox', { name: '전사문 미리보기' }) as HTMLTextAreaElement
+    const log = screen.getByRole('textbox', { name: 'Whisper 전사 로그' }) as HTMLTextAreaElement
+    for (const area of [preview, log]) {
+      Object.defineProperty(area, 'scrollHeight', { configurable: true, value: 900 })
+      Object.defineProperty(area, 'clientHeight', { configurable: true, value: 100 })
+      area.scrollTop = 0
+    }
+    const previewPin = screen.getByRole('button', { name: '전사문 미리보기 하단 고정' })
+    const logPin = screen.getByRole('button', { name: 'Whisper 전사 로그 하단 고정' })
+    expect(previewPin.getAttribute('aria-pressed')).toBe('true')
+    expect(logPin.getAttribute('aria-pressed')).toBe('true')
+    await fireEvent.click(previewPin)
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [{ ...job, transcriptPreview: '둘째 문장', transcriptionLog: '둘째 로그' }] })
+    await waitFor(() => expect(log.scrollTop).toBe(900))
+    expect(preview.scrollTop).toBe(0)
+    expect(previewPin.getAttribute('aria-pressed')).toBe('false')
+    await fireEvent.click(previewPin)
+    expect(preview.scrollTop).toBe(900)
+    await fireEvent.click(logPin)
+    log.scrollTop = 100
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [{ ...job, transcriptPreview: '셋째 문장', transcriptionLog: '셋째 로그' }] })
+    await waitFor(() => expect(log.value).toBe('셋째 로그'))
+    expect(log.scrollTop).toBe(100)
+    expect(logPin.getAttribute('aria-pressed')).toBe('false')
+  })
+  it('stops an active transcription from the processing list', async () => {
+    const media = '/tmp/회의/stop.mp4'
+    const running = { ...transcriptionJob('running'), path: media, name: 'stop.mp4', id: 'stop-1' }
+    const stopped = { ...baseState, whisperReady: true, jobs: [{ ...running, status: 'cancelled' as const, stage: 'cancelled', phase: '취소됨' }] }
+    vi.mocked(api.state).mockResolvedValueOnce({ ...baseState, whisperReady: true }).mockResolvedValue(stopped)
+    vi.mocked(api.expand).mockResolvedValue({ paths: [media] })
+    vi.mocked(api.cancelJob).mockResolvedValue(stopped)
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '폴더 선택' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '현재 폴더 추가' }))
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [running] })
+    await fireEvent.click(await screen.findByRole('button', { name: '전사 중지' }))
+    await waitFor(() => expect(api.cancelJob).toHaveBeenCalledWith('stop-1'))
+    expect(await screen.findByText('취소됨')).toBeTruthy()
   })
   it('shows only the selected media file log', async () => {
     const first = '/tmp/회의/first.mp4'
@@ -253,5 +348,43 @@ describe('workspace flow', () => {
     await fireEvent.click(screen.getByRole('button', { name: '설정 저장' }))
     await waitFor(() => expect((screen.getByRole('textbox', { name: '전사문 미리보기' }) as HTMLTextAreaElement).value).toContain('새 모델 전사가 필요합니다.'))
     expect(screen.getByRole('button', { name: '전사 시작' }).hasAttribute('disabled')).toBe(false)
+  })
+  it('turns completion notifications off and on while preserving the app preference', async () => {
+    class TestNotification {
+      static permission: NotificationPermission = 'granted'
+      static requestPermission = vi.fn(async () => TestNotification.permission)
+      constructor(_title: string, _options?: NotificationOptions) {}
+    }
+    vi.stubGlobal('Notification', TestNotification)
+    window.localStorage.setItem('meet-to-md-notifications-enabled', '1')
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    const off = screen.getByRole('button', { name: '알림 끄기' })
+    expect(off.getAttribute('aria-pressed')).toBe('true')
+    await fireEvent.click(off)
+    expect(window.localStorage.getItem('meet-to-md-notifications-enabled')).toBeNull()
+    const on = screen.getByRole('button', { name: '알림 켜기' })
+    expect(on.getAttribute('aria-pressed')).toBe('false')
+    await fireEvent.click(on)
+    expect(window.localStorage.getItem('meet-to-md-notifications-enabled')).toBe('1')
+    expect(screen.getByRole('button', { name: '알림 끄기' }).getAttribute('aria-pressed')).toBe('true')
+  })
+  it('clears finished history while keeping active jobs', async () => {
+    const finished = { ...transcriptionJob('completed'), id: 'old-1', name: 'old.mp4', path: '/tmp/회의/old.mp4' }
+    const active = { ...transcriptionJob('running'), id: 'live-1', name: 'live.mp4', path: '/tmp/회의/live.mp4' }
+    const initial = { ...baseState, whisperReady: true, jobs: [finished, active] }
+    const remaining = { ...baseState, whisperReady: true, jobs: [active] }
+    vi.mocked(api.state).mockResolvedValue(initial)
+    vi.mocked(api.deleteFinishedJobs).mockResolvedValue({ deleted: 1, state: remaining })
+    render(App)
+    await screen.findByText('old.mp4')
+    const clear = screen.getByRole('button', { name: '완료 기록 지우기' }) as HTMLButtonElement
+    expect(clear.disabled).toBe(false)
+    await fireEvent.click(clear)
+    await waitFor(() => expect(api.deleteFinishedJobs).toHaveBeenCalledTimes(1))
+    expect(window.confirm).toHaveBeenCalledWith('완료·실패·중단 기록을 모두 지울까요?\n생성된 SRT와 Markdown 파일은 삭제되지 않습니다.')
+    await waitFor(() => expect(screen.queryByText('old.mp4')).toBeNull())
+    expect(screen.getByText('live.mp4')).toBeTruthy()
+    expect(clear.disabled).toBe(true)
   })
 })

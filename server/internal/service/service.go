@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"meet-to-md/server/internal/codexapp"
 	"meet-to-md/server/internal/config"
@@ -130,21 +131,62 @@ func (s *Service) UpdateConfig(next config.Config) error {
 }
 
 func (s *Service) Snapshot() Snapshot { s.mu.RLock(); defer s.mu.RUnlock(); return s.snapshotLocked() }
+func (s *Service) UISnapshot() Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.uiSnapshotLocked()
+}
 func (s *Service) snapshotLocked() Snapshot {
 	jobs := append([]Job{}, s.jobs...)
 	_, err := config.ResolveBinary(s.cfg.CodexBinary)
 	return Snapshot{Jobs: jobs, CodexReady: err == nil, WhisperReady: s.whisperReadyLocked(), WhisperInstalling: s.whisperInstalling, WhisperError: s.whisperError, WhisperInstall: s.whisperInstall}
+}
+func (s *Service) uiSnapshotLocked() Snapshot {
+	snapshot := s.snapshotLocked()
+	jobs := make([]Job, 0, len(snapshot.Jobs))
+	finished := 0
+	for i := len(snapshot.Jobs) - 1; i >= 0; i-- {
+		job := snapshot.Jobs[i]
+		active := job.Status == "queued" || job.Status == "preparing" || job.Status == "running"
+		if !active {
+			if finished >= 50 {
+				continue
+			}
+			finished++
+			job.Result = ""
+			job.RecentOutput = ""
+			job.TranscriptionLog = ""
+			job.TranscriptPreview = ""
+			job.Prompt = ""
+		}
+		jobs = append(jobs, job)
+	}
+	for i, j := 0, len(jobs)-1; i < j; i, j = i+1, j-1 {
+		jobs[i], jobs[j] = jobs[j], jobs[i]
+	}
+	snapshot.Jobs = jobs
+	return snapshot
+}
+func (s *Service) Job(id string) (Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, job := range s.jobs {
+		if job.ID == id {
+			return job, nil
+		}
+	}
+	return Job{}, os.ErrNotExist
 }
 func (s *Service) Subscribe() (<-chan Snapshot, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ch := make(chan Snapshot, 1)
 	s.subs[ch] = struct{}{}
-	ch <- s.snapshotLocked()
+	ch <- s.uiSnapshotLocked()
 	return ch, func() { s.mu.Lock(); defer s.mu.Unlock(); delete(s.subs, ch); close(ch) }
 }
 func (s *Service) broadcastLocked() {
-	snapshot := s.snapshotLocked()
+	snapshot := s.uiSnapshotLocked()
 	for ch := range s.subs {
 		select {
 		case ch <- snapshot:
@@ -416,6 +458,30 @@ func (s *Service) Delete(id string) error {
 	}
 	return os.ErrNotExist
 }
+
+func (s *Service) DeleteFinished() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := make([]Job, 0, len(s.jobs))
+	for _, job := range s.jobs {
+		if job.Status == "queued" || job.Status == "preparing" || job.Status == "running" {
+			kept = append(kept, job)
+		}
+	}
+	deleted := len(s.jobs) - len(kept)
+	if deleted == 0 {
+		return 0, nil
+	}
+	previous := s.jobs
+	s.jobs = kept
+	if err := s.persistLocked(); err != nil {
+		s.jobs = previous
+		return 0, err
+	}
+	s.broadcastLocked()
+	return deleted, nil
+}
+
 func (s *Service) Cancel(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -514,6 +580,16 @@ func (s *Service) process(ctx context.Context, j Job) {
 			return
 		}
 		minutesPath = target
+		s.mutate(j.ID, func(next *Job) {
+			next.TranscriptPath = transcriptPath
+			next.Phase = "SRT 저장 완료 · 회의록 준비 중"
+		})
+	} else if !IsText(j.Path) {
+		transcriptPath, err := saveStandaloneTranscript(j.Path, cfg.OutputDir, input)
+		if err != nil {
+			s.fail(j.ID, fmt.Errorf("SRT 저장 실패: %w", err))
+			return
+		}
 		s.mutate(j.ID, func(next *Job) {
 			next.TranscriptPath = transcriptPath
 			next.Phase = "SRT 저장 완료 · 회의록 준비 중"
@@ -646,7 +722,11 @@ func (s *Service) fail(id string, err error) {
 }
 func tail(value string, n int) string {
 	if len(value) > n {
-		return value[len(value)-n:]
+		start := len(value) - n
+		for start < len(value) && !utf8.RuneStart(value[start]) {
+			start++
+		}
+		return value[start:]
 	}
 	return value
 }
@@ -735,6 +815,29 @@ func saveVideoTranscript(source, outputDir, transcript string) (string, string, 
 	return "", "", errors.New("사용 가능한 SRT·회의록 파일명을 찾지 못했습니다")
 }
 
+func saveStandaloneTranscript(source, outputDir, transcript string) (string, error) {
+	if outputDir == "" {
+		outputDir = filepath.Dir(source)
+	}
+	base := strings.TrimSuffix(filepath.Base(source), filepath.Ext(source)) + "_전사"
+	for n := 0; n < 1000; n++ {
+		name := base
+		if n > 0 {
+			name = fmt.Sprintf("%s_%d", base, n+1)
+		}
+		path := filepath.Join(outputDir, name+".srt")
+		err := writeNewTextFile(path, transcript)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return "", errors.New("사용 가능한 SRT 파일명을 찾지 못했습니다")
+}
+
 func writeNewTextFile(path, content string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
@@ -776,7 +879,7 @@ func (s *Service) PreviewState(path string) (string, bool, error) {
 			return "", false, err
 		}
 		if ready {
-			return headPreview(transcript, 64*1024), true, nil
+			return tailPreview(transcript, 64*1024), true, nil
 		}
 		return "미디어 파일입니다. 전사를 시작하면 이곳에 전사문이 표시됩니다.", false, nil
 	}

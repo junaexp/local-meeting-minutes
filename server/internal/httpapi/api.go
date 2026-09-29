@@ -29,7 +29,7 @@ func (a API) Router() http.Handler {
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
 	r.Use(localOnly)
 	r.Route("/api", func(r chi.Router) {
-		r.Get("/state", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Snapshot()) })
+		r.Get("/state", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.UISnapshot()) })
 		r.Get("/events", a.events)
 		r.Get("/config", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Config()) })
 		r.Get("/environment", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, a.Service.Environment()) })
@@ -39,8 +39,10 @@ func (a API) Router() http.Handler {
 		r.Get("/preview", a.preview)
 		r.Post("/import", a.importFile)
 		r.Post("/jobs", a.createJobs)
+		r.Delete("/jobs", a.deleteFinishedJobs)
 		r.Post("/transcriptions", a.createTranscription)
 		r.Delete("/jobs/{id}", a.deleteJob)
+		r.Get("/jobs/{id}", a.job)
 		r.Post("/jobs/{id}/cancel", a.cancelJob)
 		r.Get("/jobs/{id}/transcript", a.jobTranscript)
 		r.Get("/models", a.models)
@@ -231,6 +233,14 @@ func (a API) deleteJob(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
+func (a API) deleteFinishedJobs(w http.ResponseWriter, r *http.Request) {
+	deleted, err := a.Service.DeleteFinished()
+	if err != nil {
+		bad(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "state": a.Service.UISnapshot()})
+}
 func (a API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if err := a.Service.Cancel(chi.URLParam(r, "id")); err != nil {
 		status := 409
@@ -240,7 +250,15 @@ func (a API) cancelJob(w http.ResponseWriter, r *http.Request) {
 		bad(w, status, err)
 		return
 	}
-	writeJSON(w, 200, a.Service.Snapshot())
+	writeJSON(w, 200, a.Service.UISnapshot())
+}
+func (a API) job(w http.ResponseWriter, r *http.Request) {
+	job, err := a.Service.Job(chi.URLParam(r, "id"))
+	if err != nil {
+		bad(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
 }
 func (a API) events(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)

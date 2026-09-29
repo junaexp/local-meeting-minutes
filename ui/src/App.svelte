@@ -6,23 +6,33 @@
   import { NativeSelect } from '$lib/components/ui/native-select/index.js'
   import * as Dialog from '$lib/components/ui/dialog/index.js'
   import { api, type BrowseResult, type Config, type Environment, type Job, type Model, type Snapshot } from '$lib/api'
-  import { addPaths, moveFile, removeFile, type CartFile } from '$lib/cart'
+  import { addPaths, attachTranscript, moveFile, removeFile, type CartFile } from '$lib/cart'
 
   let state: Snapshot = { jobs: [], codexReady: false, whisperReady: false, whisperInstalling: false, whisperError: '' }
   let config: Config | null = null
   let promptValue = ''
   let cart: CartFile[] = []
+  let cartRestored = false
+  let savedCart = ''
   let selectedPath = ''
   let preview = '파일을 선택하면 여기에 원문을 표시합니다.'
   let previewTranscribed = false
   let previewLoading = false
   let previewRequest = 0
   let transcriptionBusyPath = ''
+  let previewArea: HTMLTextAreaElement
   let whisperLogArea: HTMLTextAreaElement
   let installLogArea: HTMLTextAreaElement
+  let previewAtBottom = true
   let logAtBottom = true
+  let lastScrolledPreview = ''
+  let lastScrolledPreviewArea: HTMLTextAreaElement | undefined
   let lastScrolledLog = ''
   let lastScrolledLogArea: HTMLTextAreaElement | undefined
+  let detailPreviewArea: HTMLTextAreaElement
+  let detailPreviewAtBottom = true
+  let lastScrolledDetailPreview = ''
+  let lastScrolledDetailPreviewArea: HTMLTextAreaElement | undefined
   let detailLogArea: HTMLTextAreaElement
   let detailLogAtBottom = true
   let lastScrolledDetailLog = ''
@@ -42,6 +52,10 @@
   let browserPath = ''
   let browserBusy = false
   let detailId = ''
+  let detailFullJob: Job | null = null
+  let detailJobRequest = 0
+  let selectedFullMediaJob: Job | null = null
+  let selectedMediaJobRequest = 0
   let promptEditing = false
   let settingsDraft: Config | null = null
   let environment: Environment | null = null
@@ -55,6 +69,10 @@
   let dropActive = false
   let notificationsEnabled = false
   let knownCompleted = new Set<string>()
+  let knownCompletedInitialized = false
+  let clearingFinished = false
+  let cancellingIds = new Set<string>()
+  const cancelTimers = new Map<string, number>()
   let connectionIssue: 'none' | 'stream' | 'invalid' | 'server' = 'none'
   let lastStateAt = 0
   let lastStreamAt = Date.now()
@@ -64,13 +82,18 @@
   let recoveryPending = false
   let retryRecoveryAfterPending = false
   let disposed = false
-  $: detailJob = state.jobs.find(job => job.id === detailId)
+  const notificationStorageKey = 'meet-to-md-notifications-enabled'
+  $: stateDetailJob = state.jobs.find(job => job.id === detailId)
+  $: detailJob = stateDetailJob && !isActive(stateDetailJob) && detailFullJob?.id === detailId ? detailFullJob : stateDetailJob
   $: installPercent = state.whisperInstall?.total ? Math.min(100, Math.round(state.whisperInstall.downloaded * 100 / state.whisperInstall.total)) : null
   $: selectedFile = cart.find(file => file.path === selectedPath)
-  $: selectedMediaJob = [...state.jobs].reverse().find(job => job.path === selectedPath && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel && (job.kind === 'transcription' || !!job.transcriptionLog))
-  $: selectedLog = selectedMediaJob?.transcriptionLog || ''
+  $: selectedMediaJob = [...state.jobs].reverse().find(job => job.path === selectedPath && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel && (job.kind === 'transcription' || isMedia(job.path)))
+  $: selectedLog = (selectedMediaJob && !isActive(selectedMediaJob) && selectedFullMediaJob?.id === selectedMediaJob.id ? selectedFullMediaJob.transcriptionLog : selectedMediaJob?.transcriptionLog) || ''
+  $: selectedPreviewText = previewTranscribed ? preview : selectedMediaJob?.transcriptPreview || (previewLoading ? '불러오는 중...' : preview)
   $: detailTranscribing = detailJob?.kind === 'transcription' || ['extracting', 'transcribing', 'transcribed'].includes(detailJob?.stage || '')
+  $: detailPreviewText = detailTranscribing ? detailJob?.transcriptPreview || detailTranscript || '전사문을 기다리는 중입니다.' : detailJob?.result || '결과를 기다리는 중입니다.'
   $: detailLog = detailTranscribing ? detailJob?.transcriptionLog || '' : detailJob?.recentOutput || ''
+  $: readyFiles = cart.filter(file => !file.disabled)
   $: activeJobs = state.jobs.filter(job => ['queued', 'preparing', 'running'].includes(job.status))
   $: finishedJobs = state.jobs.filter(job => !['queued', 'preparing', 'running'].includes(job.status)).slice().reverse()
   $: selectedModel = models.find(item => item.model === model || item.id === model)
@@ -79,18 +102,35 @@
   function isMedia(path: string) { return /\.(wav|mp3|m4a|mp4|mov|ogg)$/i.test(path) }
   function isActive(job?: Job) { return !!job && ['queued', 'preparing', 'running'].includes(job.status) }
   function hasTranscript(job?: Job) { return !!job && (job.stage === 'transcribed' || (job.kind === 'transcription' && job.status === 'completed') || (!!job.transcriptionLog && ['drafting', 'completed'].includes(job.stage || ''))) }
-  function updateScrollPin(event: Event, detail = false) {
-    const area = event.currentTarget as HTMLTextAreaElement
-    const pinned = area.scrollTop + area.clientHeight >= area.scrollHeight - 24
-    if (detail) detailLogAtBottom = pinned
-    else logAtBottom = pinned
+  function toggleScrollPin(area: 'preview' | 'log' | 'detail-preview' | 'detail-log') {
+    if (area === 'preview') { previewAtBottom = !previewAtBottom; if (previewAtBottom && previewArea) previewArea.scrollTop = previewArea.scrollHeight }
+    else if (area === 'log') { logAtBottom = !logAtBottom; if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight }
+    else if (area === 'detail-preview') { detailPreviewAtBottom = !detailPreviewAtBottom; if (detailPreviewAtBottom && detailPreviewArea) detailPreviewArea.scrollTop = detailPreviewArea.scrollHeight }
+    else { detailLogAtBottom = !detailLogAtBottom; if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight }
   }
   // Scroll only when the log or its textarea changes; scroll events can trigger another update.
   afterUpdate(() => {
+    if (cartRestored) {
+      const value = JSON.stringify(cart)
+      if (value !== savedCart) {
+        try { window.localStorage.setItem('meet-to-md-cart-v1', value); savedCart = value }
+        catch { /* The current page can still use its in-memory list. */ }
+      }
+    }
+    if (selectedPreviewText !== lastScrolledPreview || previewArea !== lastScrolledPreviewArea) {
+      lastScrolledPreview = selectedPreviewText
+      lastScrolledPreviewArea = previewArea
+      if (previewAtBottom && previewArea) previewArea.scrollTop = previewArea.scrollHeight
+    }
     if (selectedLog !== lastScrolledLog || whisperLogArea !== lastScrolledLogArea) {
       lastScrolledLog = selectedLog
       lastScrolledLogArea = whisperLogArea
       if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight
+    }
+    if (detailPreviewText !== lastScrolledDetailPreview || detailPreviewArea !== lastScrolledDetailPreviewArea) {
+      lastScrolledDetailPreview = detailPreviewText
+      lastScrolledDetailPreviewArea = detailPreviewArea
+      if (detailPreviewAtBottom && detailPreviewArea) detailPreviewArea.scrollTop = detailPreviewArea.scrollHeight
     }
     if (detailLog !== lastScrolledDetailLog || detailLogArea !== lastScrolledDetailLogArea) {
       lastScrolledDetailLog = detailLog
@@ -115,12 +155,23 @@
     if (!next || typeof next !== 'object' || (next.jobs != null && !Array.isArray(next.jobs))) throw new Error('올바르지 않은 작업 상태입니다.')
     next = { ...next, jobs: next.jobs ?? [] }
     if (next.jobs.some(job => !job || typeof job !== 'object')) throw new Error('올바르지 않은 작업 목록입니다.')
+    const previousJobs = new Map(state.jobs.map(job => [job.id, job]))
     const whisperChanged = state.whisperReady !== next.whisperReady || (state.whisperInstalling && !next.whisperInstalling)
-    const newlyTranscribed = isMedia(selectedPath) && next.jobs.some(job => job.path === selectedPath && hasTranscript(job) && !hasTranscript(state.jobs.find(previous => previous.id === job.id)))
-    const detailCompleted = next.jobs.some(job => job.id === detailId && job.kind === 'transcription' && job.status === 'completed' && state.jobs.find(previous => previous.id === job.id)?.status !== 'completed')
-    const completedForNotification = notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted'
+    const newlyTranscribed = isMedia(selectedPath) && next.jobs.some(job => job.path === selectedPath && hasTranscript(job) && !hasTranscript(previousJobs.get(job.id)))
+    const detailFinished = next.jobs.find(job => job.id === detailId && !isActive(job) && previousJobs.get(job.id)?.status !== job.status)
+    const selectedMediaFinished = isMedia(selectedPath) ? [...next.jobs].reverse().find(job => job.path === selectedPath && !isActive(job) && previousJobs.get(job.id)?.status !== job.status) : undefined
+    let nextCart = cart
+    for (const job of next.jobs) {
+      if (job.transcriptPath && isMedia(job.path) && previousJobs.get(job.id)?.transcriptPath !== job.transcriptPath) {
+        nextCart = attachTranscript(nextCart, job.path, job.transcriptPath)
+      }
+      if (cancellingIds.has(job.id) && !isActive(job)) clearCancelling(job.id)
+    }
+    if (nextCart !== cart) cart = nextCart
+    const completedForNotification = knownCompletedInitialized && notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted'
       ? next.jobs.filter(job => job.status === 'completed' && !knownCompleted.has(job.id)) : []
     knownCompleted = new Set(next.jobs.filter(job => job.status === 'completed').map(job => job.id))
+    knownCompletedInitialized = true
     state = next
     for (const job of completedForNotification) {
       try { new Notification(job.kind === 'transcription' ? '전사 완료' : '회의록 생성 완료', { body: `${job.name} · ${job.kind === 'transcription' ? '전사문 준비됨' : '저장 완료'}` }) }
@@ -128,7 +179,12 @@
     }
     if (settingsOpen && whisperChanged) void refreshEnvironment()
     if (newlyTranscribed) void loadPreview(selectedPath)
-    if (detailCompleted) void loadDetailTranscript(detailId)
+    if (detailFinished) {
+      detailFullJob = null
+      void loadDetailJob(detailFinished.id)
+      if (detailFinished.kind === 'transcription') void loadDetailTranscript(detailFinished.id)
+    }
+    if (selectedMediaFinished) void loadMediaJob(selectedMediaFinished)
   }
   async function resyncState(force = false) {
     const now = Date.now()
@@ -156,6 +212,23 @@
   }
   onMount(() => {
     disposed = false
+    try {
+      notificationsEnabled = window.localStorage.getItem(notificationStorageKey) === '1' && 'Notification' in window && Notification.permission === 'granted'
+    } catch { notificationsEnabled = false }
+    try {
+      const stored: unknown = JSON.parse(window.localStorage.getItem('meet-to-md-cart-v1') || '[]')
+      if (Array.isArray(stored)) {
+        const seen = new Set<string>()
+        cart = stored.filter((item): item is CartFile => {
+          if (!item || typeof item.path !== 'string' || !item.path || typeof item.name !== 'string' || seen.has(item.path)) return false
+          seen.add(item.path)
+          return true
+        }).slice(0, 200).map(item => ({ path: item.path, name: item.name, disabled: item.disabled === true, sourcePath: typeof item.sourcePath === 'string' ? item.sourcePath : undefined }))
+      }
+    } catch { cart = [] }
+    savedCart = JSON.stringify(cart)
+    cartRestored = true
+    if (cart.length) void selectFile(cart.find(file => !file.disabled)?.path || cart[0].path)
     const initialRequestVersion = ++stateRequestVersion
     api.state().then(next => {
       if (disposed) return
@@ -188,7 +261,7 @@
     }, 5_000)
     const onVisibilityChange = () => { if (!document.hidden) void resyncState(true) }
     document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => { disposed = true; window.clearInterval(watchdog); document.removeEventListener('visibilitychange', onVisibilityChange); stream.close() }
+    return () => { disposed = true; window.clearInterval(watchdog); for (const timer of cancelTimers.values()) window.clearTimeout(timer); cancelTimers.clear(); document.removeEventListener('visibilitychange', onVisibilityChange); stream.close() }
   })
   async function loadPreview(path: string) {
     const request = ++previewRequest
@@ -200,11 +273,25 @@
     finally { if (request === previewRequest && selectedPath === path) previewLoading = false }
   }
   function selectFile(path: string) {
-    selectedPath = path; preview = ''; previewTranscribed = false; logAtBottom = true
+    selectedPath = path; preview = ''; previewTranscribed = false; previewAtBottom = true; logAtBottom = true
+    selectedFullMediaJob = null
+    ++selectedMediaJobRequest
     void loadPreview(path)
+    if (isMedia(path)) {
+      const latest = [...state.jobs].reverse().find(job => job.path === path && !isActive(job))
+      if (latest) void loadMediaJob(latest)
+    }
   }
-  function addToCart(paths: string[]) { cart = addPaths(cart, paths); if (!selectedPath && cart.length) void selectFile(cart[0].path) }
-  function removeFromCart(path: string) { cart = removeFile(cart, path); if (selectedPath === path) { ++previewRequest; selectedPath = ''; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; if (cart.length) void selectFile(cart[0].path) } }
+  function addToCart(paths: string[]) {
+    let next = addPaths(cart, paths)
+    for (const path of paths) {
+      const transcript = [...state.jobs].reverse().find(job => job.path === path && job.transcriptPath)?.transcriptPath
+      if (transcript) next = attachTranscript(next, path, transcript)
+    }
+    cart = next
+    if (!selectedPath && cart.length) void selectFile(cart[0].path)
+  }
+  function removeFromCart(path: string) { cart = removeFile(cart, path); if (selectedPath === path) { ++previewRequest; ++selectedMediaJobRequest; selectedPath = ''; selectedFullMediaJob = null; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; if (cart.length) void selectFile(cart.find(file => !file.disabled)?.path || cart[0].path) } }
   async function startTranscription(path: string) {
     if (transcriptionBusyPath) return
     transcriptionBusyPath = path; error = ''
@@ -230,10 +317,10 @@
     finally { browserBusy = false }
   }
   async function startJobs() {
-    if (!cart.length || busy) return
-    if (!window.confirm(`${cart.length}개 파일을 표시된 순서대로 회의록으로 정리할까요?`)) return
+    if (!readyFiles.length || busy) return
+    if (!window.confirm(`${readyFiles.length}개 파일을 표시된 순서대로 회의록으로 정리할까요?`)) return
     busy = true; error = ''
-    try { await api.createJobs(cart.map(file => file.path), model, effort); cart = []; selectedPath = ''; ++previewRequest; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; void resyncState(true) }
+    try { await api.createJobs(readyFiles.map(file => file.path), model, effort); cart = []; selectedPath = ''; selectedFullMediaJob = null; ++previewRequest; ++selectedMediaJobRequest; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; void resyncState(true) }
     catch (err) { error = (err as Error).message } finally { busy = false }
   }
   async function refreshEnvironment() {
@@ -264,15 +351,67 @@
     catch (err) { testLog += `\n${new Date().toLocaleTimeString()} · 오류: ${(err as Error).message}` }
     finally { testRunning = false }
   }
-  async function enableNotifications() { if (!('Notification' in window)) { error = '이 브라우저는 알림을 지원하지 않습니다.'; return }; notificationsEnabled = (await Notification.requestPermission()) === 'granted'; if (!notificationsEnabled) error = '브라우저 알림 권한이 허용되지 않았습니다.' }
+  async function toggleNotifications() {
+    error = ''
+    if (notificationsEnabled) {
+      notificationsEnabled = false
+      try { window.localStorage.removeItem(notificationStorageKey) } catch { /* The current page still keeps the setting. */ }
+      return
+    }
+    if (!('Notification' in window)) { error = '이 브라우저는 알림을 지원하지 않습니다.'; return }
+    const permission = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission()
+    notificationsEnabled = permission === 'granted'
+    if (notificationsEnabled) {
+      try { window.localStorage.setItem(notificationStorageKey, '1') } catch { /* The current page still keeps the setting. */ }
+    } else {
+      error = permission === 'denied' ? '브라우저 설정에서 알림 권한을 허용해 주세요.' : '브라우저 알림 권한이 허용되지 않았습니다.'
+    }
+  }
   async function copy(value: string) { try { await navigator.clipboard.writeText(value) } catch { error = '복사할 수 없습니다. 브라우저 권한을 확인해 주세요.' } }
-  async function deleteJob(job: Job) { try { await api.deleteJob(job.id); if (detailId === job.id) detailId = ''; void resyncState(true) } catch (err) { error = (err as Error).message } }
-  async function cancelJob(job: Job) { try { const next = await api.cancelJob(job.id); stateRequestVersion++; acceptState(next); lastStateAt = Date.now(); void resyncState(true) } catch (err) { error = (err as Error).message } }
+  async function deleteJob(job: Job) { try { await api.deleteJob(job.id); if (detailId === job.id) closeDetail(); void resyncState(true) } catch (err) { error = (err as Error).message } }
+  async function clearFinishedJobs() {
+    if (!finishedJobs.length || clearingFinished) return
+    if (!window.confirm('완료·실패·중단 기록을 모두 지울까요?\n생성된 SRT와 Markdown 파일은 삭제되지 않습니다.')) return
+    const closeFinishedDetail = !!detailJob && !isActive(detailJob)
+    clearingFinished = true; error = ''
+    try {
+      const result = await api.deleteFinishedJobs()
+      if (closeFinishedDetail) closeDetail()
+      stateRequestVersion++
+      acceptState(result.state)
+      lastStateAt = Date.now()
+    } catch (err) { error = (err as Error).message }
+    finally { clearingFinished = false }
+  }
+  function clearCancelling(id: string) {
+    cancellingIds = new Set([...cancellingIds].filter(value => value !== id))
+    const timer = cancelTimers.get(id)
+    if (timer !== undefined) window.clearTimeout(timer)
+    cancelTimers.delete(id)
+  }
+  async function cancelJob(job: Job) {
+    if (cancellingIds.has(job.id)) return
+    cancellingIds = new Set(cancellingIds).add(job.id)
+    cancelTimers.set(job.id, window.setTimeout(() => clearCancelling(job.id), 15_000))
+    try { const next = await api.cancelJob(job.id); stateRequestVersion++; acceptState(next); lastStateAt = Date.now(); void resyncState(true) }
+    catch (err) { clearCancelling(job.id); error = (err as Error).message }
+  }
   async function loadDetailTranscript(id: string) {
     try { const result = await api.jobTranscript(id); if (detailId === id) detailTranscript = result.text }
     catch { if (detailId === id) detailTranscript = '' }
   }
-  function openDetail(job: Job) { detailId = job.id; detailTranscript = ''; detailLogAtBottom = true; if (job.kind === 'transcription' || ['extracting', 'transcribing', 'transcribed'].includes(job.stage || '')) void loadDetailTranscript(job.id) }
+  async function loadDetailJob(id: string) {
+    const request = ++detailJobRequest
+    try { const job = await api.job(id); if (detailId === id && request === detailJobRequest) detailFullJob = job }
+    catch (cause) { if (detailId === id && request === detailJobRequest) error = `작업 상세 정보를 읽지 못했습니다: ${(cause as Error).message}` }
+  }
+  async function loadMediaJob(job: Job) {
+    const request = ++selectedMediaJobRequest
+    try { const full = await api.job(job.id); if (selectedPath === job.path && request === selectedMediaJobRequest) selectedFullMediaJob = full }
+    catch { /* Live status and the saved SRT remain available. */ }
+  }
+  function openDetail(job: Job) { detailId = job.id; detailFullJob = null; ++detailJobRequest; detailTranscript = ''; detailPreviewAtBottom = true; detailLogAtBottom = true; if (!isActive(job)) void loadDetailJob(job.id); if (job.kind === 'transcription' || ['extracting', 'transcribing', 'transcribed'].includes(job.stage || '')) void loadDetailTranscript(job.id) }
+  function closeDetail() { detailId = ''; detailFullJob = null; detailTranscript = ''; ++detailJobRequest }
   function onDrop(event: DragEvent) { event.preventDefault(); dropActive = false; if (event.dataTransfer?.files.length) void importFiles(event.dataTransfer.files) }
   function onCartDrop(event: DragEvent, index: number) { event.preventDefault(); cart = moveFile(cart, dragIndex, index); dragIndex = -1 }
 </script>
@@ -288,25 +427,26 @@
   {#if state.whisperError}<div role="alert" class="error" style="margin-bottom:12px">Whisper 설치 실패: {state.whisperError}</div>{/if}
   <main class="workspace">
     <section class="panel" aria-labelledby="input-title">
-      <div class="section-top"><h2 id="input-title" class="section-number">01 / INPUT</h2><span class="compact muted">{cart.length}개 파일</span></div>
+      <div class="section-top"><h2 id="input-title" class="section-number">01 / INPUT</h2><span class="compact muted">{readyFiles.length}개 파일</span></div>
       <div class="button-row"><Button onclick={() => openBrowser('file')}>파일 선택</Button><Button variant="outline" onclick={() => openBrowser('folder')}>폴더 선택</Button></div>
       <input aria-label="컴퓨터에서 파일 가져오기" bind:this={uploadInput} hidden type="file" multiple accept=".srt,.vtt,.txt,.md,.wav,.mp3,.m4a,.mp4,.mov,.ogg" onchange={event => importFiles(event.currentTarget.files || [])} />
       <button class:active={dropActive} class="drop-zone" ondragover={event => { event.preventDefault(); dropActive = true }} ondragleave={() => dropActive = false} ondrop={onDrop} onclick={() => uploadInput?.click()}>파일을 여기에 끌어놓거나 컴퓨터에서 가져오기<br /><span class="tiny muted">SRT · VTT · TXT · MD · 오디오 · 영상</span></button>
       <div class="queue-title"><h3 class="section-title">처리 순서</h3><span class="tiny muted">끌어서 순서 변경</span></div>
-      {#if cart.length}<ol class="cart-list">{#each cart as file, index (file.path)}<li class:selected={selectedPath === file.path} class="cart-item" draggable="true" ondragstart={() => dragIndex = index} ondragover={event => event.preventDefault()} ondrop={event => onCartDrop(event, index)}>
-        <span class="tiny muted">{String(index + 1).padStart(2, '0')}</span><button class="cart-main" onclick={() => selectFile(file.path)} title={file.path}><span class="truncate">{file.name}</span><span class="tiny muted truncate">{file.path}</span></button>
-        <span class="cart-controls"><button class="mini-button" aria-label={`${file.name} 위로`} disabled={index === 0} onclick={() => cart = moveFile(cart, index, index - 1)}>↑</button><button class="mini-button" aria-label={`${file.name} 아래로`} disabled={index === cart.length - 1} onclick={() => cart = moveFile(cart, index, index + 1)}>↓</button></span>
+      {#if cart.length}<ol class="cart-list">{#each cart as file, index (file.path)}<li class:selected={selectedPath === file.path} class:disabled={file.disabled} class="cart-item" draggable={!file.disabled} ondragstart={() => dragIndex = index} ondragover={event => event.preventDefault()} ondrop={event => onCartDrop(event, index)}>
+        <span class="tiny muted">{file.disabled ? '원본' : String(readyFiles.indexOf(file) + 1).padStart(2, '0')}</span><button class="cart-main" onclick={() => selectFile(file.path)} title={file.path}><span class="truncate">{file.name}</span><span class="tiny muted truncate">{file.path}</span></button>
+        <span class="cart-controls"><button class="mini-button" aria-label={`${file.name} 위로`} disabled={file.disabled || index === 0} onclick={() => cart = moveFile(cart, index, index - 1)}>↑</button><button class="mini-button" aria-label={`${file.name} 아래로`} disabled={file.disabled || index === cart.length - 1} onclick={() => cart = moveFile(cart, index, index + 1)}>↓</button></span>
         <button class="mini-button" aria-label={`${file.name} 삭제`} onclick={() => removeFromCart(file.path)}>×</button>
+        {#if file.disabled}<span class="cart-source-note">전사 완료 · 회의록 처리 제외</span>{/if}
         {#if isMedia(file.path)}{@const fileJob = [...state.jobs].reverse().find(job => job.path === file.path && job.kind === 'transcription' && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel)}{@const fileReady = selectedPath === file.path && previewTranscribed}
-          <div class="cart-media-actions"><span class="tiny muted">{fileReady ? '전사문 준비됨' : fileJob?.status === 'failed' ? '전사 실패 · 다시 시도 가능' : isActive(fileJob) ? fileJob?.phase : '오디오·영상 전사'}</span><Button size="xs" disabled={transcriptionBusyPath === file.path || isActive(fileJob) || fileReady || !state.whisperReady} onclick={() => startTranscription(file.path)}>{isActive(fileJob) ? '전사 중' : fileReady ? '전사 완료' : '전사 시작'}</Button></div>
+          <div class="cart-media-actions"><span class="tiny muted">{fileReady ? '전사문 준비됨' : fileJob?.status === 'failed' ? '전사 실패 · 다시 시도 가능' : isActive(fileJob) ? fileJob?.phase : '오디오·영상 전사'}</span>{#if fileJob && isActive(fileJob)}<Button size="xs" variant="destructive" disabled={cancellingIds.has(fileJob.id)} onclick={() => cancelJob(fileJob)}>{cancellingIds.has(fileJob.id) ? '중지 요청 중' : '전사 중지'}</Button>{:else}<Button size="xs" disabled={transcriptionBusyPath === file.path || (!file.disabled && fileReady) || !state.whisperReady} onclick={() => startTranscription(file.path)}>{file.disabled ? '다시 전사' : fileReady ? '전사 완료' : '전사 시작'}</Button>{/if}</div>
         {/if}
       </li>{/each}</ol>{:else}<p class="empty">파일을 등록하면 여기에서 순서를 바꿀 수 있습니다.</p>{/if}
     </section>
-    <section class="panel" aria-labelledby="preview-title"><div class="section-top"><h2 id="preview-title" class="section-number">02 / PREVIEW</h2></div><div class="preview-file"><div class="section-title truncate">{selectedFile?.name || '선택한 파일 없음'}</div><div class="tiny muted truncate">{selectedFile?.path || '왼쪽에서 파일을 선택해 주세요.'}</div></div><div class="section-top"><h3 class="section-title">{selectedFile && isMedia(selectedFile.path) ? '전사문 미리보기' : '텍스트 미리보기'}</h3><span class="tiny muted">앞 64KB 표시</span></div>
+    <section class="panel" aria-labelledby="preview-title"><div class="section-top"><h2 id="preview-title" class="section-number">02 / PREVIEW</h2></div><div class="preview-file"><div class="section-title truncate">{selectedFile?.name || '선택한 파일 없음'}</div><div class="tiny muted truncate">{selectedFile?.path || '왼쪽에서 파일을 선택해 주세요.'}</div></div><div class="section-top"><h3 class="section-title">{selectedFile && isMedia(selectedFile.path) ? '전사문 미리보기' : '텍스트 미리보기'}</h3>{#if selectedFile && isMedia(selectedFile.path)}<button class:active={previewAtBottom} class="scroll-pin" aria-label="전사문 미리보기 하단 고정" aria-pressed={previewAtBottom} onclick={() => toggleScrollPin('preview')}>하단 고정 {previewAtBottom ? '켬' : '끔'}</button>{:else}<span class="tiny muted">앞 64KB 표시</span>{/if}</div>
       {#if selectedFile && isMedia(selectedFile.path)}
-        <textarea class="preview-box media-preview-box" aria-label="전사문 미리보기" readonly value={previewTranscribed ? preview : selectedMediaJob?.transcriptPreview || (previewLoading ? '불러오는 중...' : preview)}></textarea>
-        <div class="section-top media-log-title"><h3 class="section-title">Whisper 전사 로그</h3><span class="tiny muted">실시간 · 읽기 전용</span></div>
-        <textarea class="media-log" aria-label="Whisper 전사 로그" readonly bind:this={whisperLogArea} onscroll={event => updateScrollPin(event)} value={selectedLog || '전사를 시작하면 FFmpeg와 Whisper 실행 내용이 여기에 표시됩니다.'}></textarea>
+        <textarea class="preview-box media-preview-box" aria-label="전사문 미리보기" readonly bind:this={previewArea} value={selectedPreviewText}></textarea>
+        <div class="section-top media-log-title"><h3 class="section-title">Whisper 전사 로그</h3><button class:active={logAtBottom} class="scroll-pin" aria-label="Whisper 전사 로그 하단 고정" aria-pressed={logAtBottom} onclick={() => toggleScrollPin('log')}>하단 고정 {logAtBottom ? '켬' : '끔'}</button></div>
+        <textarea class="media-log" aria-label="Whisper 전사 로그" readonly bind:this={whisperLogArea} value={selectedLog || '전사를 시작하면 FFmpeg와 Whisper 실행 내용이 여기에 표시됩니다.'}></textarea>
         <p class="tiny muted media-log-hint">다른 파일을 선택하면 해당 파일의 로그를 표시합니다.</p>
       {:else}<div class="preview-box" aria-live="polite">{previewLoading ? '불러오는 중...' : preview}</div>{/if}
     </section>
@@ -314,12 +454,12 @@
       <Textarea class="prompt-area" aria-label="회의록 프롬프트" readonly={!promptEditing} bind:value={promptValue} />
       <div class="panel-footer"><label class="field-label" for="model-select">GPT 모델</label><NativeSelect class="w-full" id="model-select" bind:value={model}><option value="gpt-6-astra" disabled={!modelAvailable('gpt-6-astra')}>GPT-6 Astra{modelAvailable('gpt-6-astra') ? '' : ' · CLI 업데이트 필요'}</option><option value="gpt-6-sol" disabled={!modelAvailable('gpt-6-sol')}>GPT-6 Sol{modelAvailable('gpt-6-sol') ? '' : ' · CLI 업데이트 필요'}</option><option value="gpt-5.6-sol" disabled={!modelAvailable('gpt-5.6-sol')}>GPT-5.6 Sol</option></NativeSelect>
         <label class="field-label" for="effort-select">추론 수준</label><NativeSelect class="w-full" id="effort-select" bind:value={effort}>{#each efforts as value}<option value={value}>{effortName[value]}</option>{/each}</NativeSelect>
-        <Button class="w-full mt-3" size="lg" disabled={!cart.length || busy || !state.codexReady} onclick={startJobs}>회의록 정리 시작</Button><p class="tiny muted" style="text-align:center;margin-top:8px">{cart.length}개 파일을 위에서 정한 순서대로 처리합니다.</p>
+        <Button class="w-full mt-3" size="lg" disabled={!readyFiles.length || busy || !state.codexReady} onclick={startJobs}>회의록 정리 시작</Button><p class="tiny muted" style="text-align:center;margin-top:8px">{readyFiles.length}개 파일을 위에서 정한 순서대로 처리합니다.</p>
       </div></section>
     <aside class="panel sidebar" aria-label="작업 상태"><div class="sidebar-columns">
-      <div class="notice"><div class="section-title">작업 완료 알림</div><p class="compact muted" style="margin:7px 0 0">정리가 끝나면 브라우저 알림으로 알려드릴게요.</p><Button size="sm" disabled={notificationsEnabled} onclick={enableNotifications}>{notificationsEnabled ? '알림 켜짐' : '알림 켜기'}</Button></div>
-      <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div>{#if activeJobs.length && lastStateAt}<p class="tiny muted state-checked">마지막 상태 확인 {new Date(lastStateAt).toLocaleTimeString()}</p>{/if}<div class="job-list">{#each activeJobs as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
-      <section><div class="section-top"><h2 class="section-title">완료 목록</h2><span class="tiny muted">{finishedJobs.length}건</span></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || (job.transcriptPath ? `SRT 저장됨 · ${job.error || job.phase}` : job.error || job.phase)}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
+      <div class="notice"><div class="section-title">작업 완료 알림</div><p class="compact muted" style="margin:7px 0 0">정리가 끝나면 브라우저 알림으로 알려드릴게요.</p><Button size="sm" variant={notificationsEnabled ? 'outline' : 'default'} aria-pressed={notificationsEnabled} onclick={toggleNotifications}>{notificationsEnabled ? '알림 끄기' : '알림 켜기'}</Button></div>
+      <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div>{#if activeJobs.length && lastStateAt}<p class="tiny muted state-checked">마지막 상태 확인 {new Date(lastStateAt).toLocaleTimeString()}</p>{/if}<div class="job-list">{#each activeJobs as job (job.id)}<div class="job-row"><button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{#if job.kind === 'transcription' || (isMedia(job.path) && ['extracting', 'transcribing'].includes(job.stage || ''))}<Button size="xs" variant="destructive" disabled={cancellingIds.has(job.id)} title={job.kind === 'minutes' ? '전사와 회의록 작업을 함께 중지합니다.' : '전사를 중지합니다.'} aria-label={`${job.name} ${job.kind === 'transcription' ? '전사' : '작업'} 중지`} onclick={() => cancelJob(job)}>{cancellingIds.has(job.id) ? '중지 중' : '중지'}</Button>{/if}</div>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
+      <section><div class="section-top"><h2 class="section-title">완료 목록</h2><div class="section-actions"><span class="tiny muted">{finishedJobs.length}건</span><Button size="xs" variant="destructive" aria-label="완료 기록 지우기" disabled={!finishedJobs.length || clearingFinished} onclick={clearFinishedJobs}>{clearingFinished ? '지우는 중' : '지우기'}</Button></div></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || (job.transcriptPath ? `SRT 저장됨 · ${job.error || job.phase}` : job.error || job.phase)}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
     </div></aside>
   </main>
 </div>
@@ -379,13 +519,13 @@
   {/if}
 </Dialog.Content></Dialog.Root>
 
-<Dialog.Root open={!!detailJob} onOpenChange={open => { if (!open) detailId = '' }}><Dialog.Content class="!max-w-[1280px] w-[calc(100vw-2rem)] max-h-[92vh] overflow-auto">
+<Dialog.Root open={!!detailJob} onOpenChange={open => { if (!open) closeDetail() }}><Dialog.Content class="!max-w-[1280px] w-[calc(100vw-2rem)] max-h-[92vh] overflow-auto">
   {#if detailJob}<Dialog.Header><Dialog.Title>{detailJob.name}</Dialog.Title><Dialog.Description>{detailJob.phase} · {detailJob.kind === 'transcription' ? `Whisper ${detailJob.transcriptionModel || ''}` : `${detailJob.model} / ${effortName[detailJob.effort]}`}</Dialog.Description></Dialog.Header>
-    <div class="modal-grid"><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? '전사문' : 'Codex 결과'}</h3>{#if !detailTranscribing}<Button variant="outline" size="xs" onclick={() => copy(detailJob!.result)}>복사</Button>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? '전사문' : 'Codex 결과'} readonly value={detailTranscribing ? detailJob.transcriptPreview || detailTranscript || '전사문을 기다리는 중입니다.' : detailJob.result || '결과를 기다리는 중입니다.'}></textarea></div><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'}</h3><span class="tiny muted">{isActive(detailJob) ? '실시간' : '작업 로그'}</span></div><textarea class="modal-textarea" aria-label={detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'} readonly bind:this={detailLogArea} onscroll={event => updateScrollPin(event, true)} value={detailLog || detailJob.phase}></textarea></div></div>
+    <div class="modal-grid"><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? '전사문' : 'Codex 결과'}</h3>{#if detailTranscribing}<button class:active={detailPreviewAtBottom} class="scroll-pin" aria-label="상세 전사문 하단 고정" aria-pressed={detailPreviewAtBottom} onclick={() => toggleScrollPin('detail-preview')}>하단 고정 {detailPreviewAtBottom ? '켬' : '끔'}</button>{:else}<Button variant="outline" size="xs" onclick={() => copy(detailJob!.result)}>복사</Button>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? '전사문' : 'Codex 결과'} readonly bind:this={detailPreviewArea} value={detailPreviewText}></textarea></div><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'}</h3>{#if detailTranscribing}<button class:active={detailLogAtBottom} class="scroll-pin" aria-label="상세 Whisper 전사 로그 하단 고정" aria-pressed={detailLogAtBottom} onclick={() => toggleScrollPin('detail-log')}>하단 고정 {detailLogAtBottom ? '켬' : '끔'}</button>{:else}<span class="tiny muted">{isActive(detailJob) ? '실시간' : '작업 로그'}</span>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'} readonly bind:this={detailLogArea} value={detailLog || detailJob.phase}></textarea></div></div>
     {#if detailJob.error}<div class="error">{detailJob.error}</div>{/if}
     {#if detailJob.transcriptPath}<div class="success">SRT 저장 위치: {detailJob.transcriptPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.transcriptPath!)}>경로 복사</Button></div>{/if}
     {#if detailJob.outputPath}<div class="success">회의록 저장 위치: {detailJob.outputPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.outputPath)}>경로 복사</Button></div>{/if}
     <details class="modal-section"><summary>요청 정보</summary><p class="compact muted">원본: {detailJob.path}</p><p class="compact muted">Whisper 모델: {detailJob.transcriptionModel || '설정값'}</p>{#if detailJob.kind !== 'transcription'}<p class="compact muted">Codex 모델: {detailJob.model} · {effortName[detailJob.effort]}</p><Textarea readonly value={detailJob.prompt} aria-label="전송 프롬프트" class="w-full min-h-36" />{#if detailJob.transcriptionLog}<p class="compact muted">전사 로그</p><Textarea readonly value={detailJob.transcriptionLog} aria-label="전사 로그 기록" class="w-full min-h-36" />{/if}{/if}</details>
-    <Dialog.Footer>{#if ['running','preparing','queued'].includes(detailJob.status)}<Button variant="destructive" onclick={() => cancelJob(detailJob!)}>작업 취소</Button>{:else}<Button variant="outline" onclick={() => deleteJob(detailJob!)}>목록에서 삭제</Button>{/if}<Button onclick={() => detailId = ''}>닫기</Button></Dialog.Footer>
+    <Dialog.Footer>{#if ['running','preparing','queued'].includes(detailJob.status)}<Button variant="destructive" disabled={cancellingIds.has(detailJob.id)} onclick={() => cancelJob(detailJob!)}>{cancellingIds.has(detailJob.id) ? '중지 요청 중' : '작업 중지'}</Button>{:else}<Button variant="outline" onclick={() => deleteJob(detailJob!)}>목록에서 삭제</Button>{/if}<Button onclick={closeDetail}>닫기</Button></Dialog.Footer>
   {/if}
 </Dialog.Content></Dialog.Root>

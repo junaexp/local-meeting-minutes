@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -234,6 +235,77 @@ func TestPersistenceAndCancellation(t *testing.T) {
 	}
 }
 
+func TestDeleteFinishedKeepsActiveJobsAndResultFiles(t *testing.T) {
+	root, s, _ := setup(t)
+	resultPath := filepath.Join(root, "meeting_회의록.md")
+	if err := os.WriteFile(resultPath, []byte("# 회의록"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.jobs = []Job{
+		{ID: "completed", Status: "completed", OutputPath: resultPath},
+		{ID: "failed", Status: "failed"},
+		{ID: "cancelled", Status: "cancelled"},
+		{ID: "queued", Status: "queued"},
+		{ID: "running", Status: "running"},
+	}
+	if err := s.persistLocked(); err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+
+	deleted, err := s.DeleteFinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 3 {
+		t.Fatalf("deleted %d jobs, want 3", deleted)
+	}
+	jobs := s.Snapshot().Jobs
+	if len(jobs) != 2 || jobs[0].ID != "queued" || jobs[1].ID != "running" {
+		t.Fatalf("active jobs changed: %+v", jobs)
+	}
+	if _, err := os.Stat(resultPath); err != nil {
+		t.Fatalf("result file was removed: %v", err)
+	}
+	stored, err := os.ReadFile(filepath.Join(root, "server", "data", "jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []Job
+	if err := json.Unmarshal(stored, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 2 || persisted[0].ID != "queued" || persisted[1].ID != "running" {
+		t.Fatalf("finished jobs remained persisted: %+v", persisted)
+	}
+}
+
+func TestUISnapshotKeepsLiveOutputAndSummarizesHistory(t *testing.T) {
+	_, s, _ := setup(t)
+	s.mu.Lock()
+	s.jobs = make([]Job, 0, 61)
+	for i := 0; i < 60; i++ {
+		s.jobs = append(s.jobs, Job{ID: fmt.Sprintf("old-%d", i), Status: "completed", Result: "large result", RecentOutput: "large log", TranscriptionLog: "Whisper log", TranscriptPreview: "preview", Prompt: "prompt"})
+	}
+	s.jobs = append(s.jobs, Job{ID: "live", Status: "running", TranscriptionLog: "current log", TranscriptPreview: "current preview", Prompt: "current prompt"})
+	s.mu.Unlock()
+	snapshot := s.UISnapshot()
+	if len(snapshot.Jobs) != 51 || snapshot.Jobs[0].ID != "old-10" || snapshot.Jobs[50].ID != "live" {
+		t.Fatalf("unexpected UI history window: %d jobs", len(snapshot.Jobs))
+	}
+	if old := snapshot.Jobs[0]; old.Result != "" || old.RecentOutput != "" || old.TranscriptionLog != "" || old.TranscriptPreview != "" || old.Prompt != "" {
+		t.Fatalf("finished job still carries long text: %+v", old)
+	}
+	if live := snapshot.Jobs[50]; live.TranscriptionLog != "current log" || live.TranscriptPreview != "current preview" || live.Prompt != "current prompt" {
+		t.Fatalf("live output was removed: %+v", live)
+	}
+	if full, err := s.Job("old-0"); err != nil || full.Result != "large result" {
+		t.Fatalf("full job details were lost: %+v %v", full, err)
+	}
+}
+
 func TestPreviewAndTraversalValidation(t *testing.T) {
 	root, s, _ := setup(t)
 	path := filepath.Join(root, "sample.vtt")
@@ -274,6 +346,12 @@ func TestManualTranscriptionIsReusedAndInvalidated(t *testing.T) {
 	if !strings.Contains(s.Snapshot().Jobs[0].TranscriptionLog, "Whisper 전사 시작") {
 		t.Fatal("transcription log was not retained")
 	}
+	firstTranscriptPath := s.Snapshot().Jobs[0].TranscriptPath
+	if path := firstTranscriptPath; path == "" {
+		t.Fatal("completed transcription has no exported SRT path")
+	} else if data, err := os.ReadFile(path); err != nil || !strings.Contains(string(data), "00:00:01,000") {
+		t.Fatalf("exported SRT: %q %v", data, err)
+	}
 	if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +382,9 @@ func TestManualTranscriptionIsReusedAndInvalidated(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitDone(t, s, 3)
+	if next := s.Snapshot().Jobs[2].TranscriptPath; next == firstTranscriptPath || next == "" {
+		t.Fatalf("repeat transcription overwrote the first SRT: %q", next)
+	}
 	transcriber.mu.Lock()
 	calls = transcriber.calls
 	transcriber.mu.Unlock()
@@ -362,6 +443,28 @@ func TestAutomaticMediaTranscriptionStillCreatesMinutes(t *testing.T) {
 	runner.mu.Unlock()
 	if calls != 1 || prompts != 1 {
 		t.Fatalf("auto flow ran %d transcriptions and %d Codex turns", calls, prompts)
+	}
+}
+
+func TestAudioMinutesAlsoExportSRT(t *testing.T) {
+	media, s, _, _ := setupMedia(t)
+	audio := strings.TrimSuffix(media, filepath.Ext(media)) + ".m4a"
+	if err := os.Rename(media, audio); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue([]string{audio}, "gpt-5.6-sol", "low"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	waitDone(t, s, 1)
+	job := s.Snapshot().Jobs[0]
+	if job.TranscriptPath == "" || job.OutputPath == "" {
+		t.Fatalf("audio output paths missing: %+v", job)
+	}
+	if data, err := os.ReadFile(job.TranscriptPath); err != nil || !strings.Contains(string(data), "안녕하세요") {
+		t.Fatalf("audio SRT: %q %v", data, err)
 	}
 }
 
@@ -500,5 +603,8 @@ func TestCancellingTranscriptionStopsWithoutCache(t *testing.T) {
 	_, ready, err := s.PreviewState(media)
 	if err != nil || ready {
 		t.Fatalf("cancelled transcription left cache: %v %v", ready, err)
+	}
+	if paths, err := filepath.Glob(strings.TrimSuffix(media, filepath.Ext(media)) + "_전사*.srt"); err != nil || len(paths) != 0 {
+		t.Fatalf("cancelled transcription exported SRT: %v %v", paths, err)
 	}
 }

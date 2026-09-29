@@ -117,7 +117,7 @@ func runStreamingCommand(cmd *exec.Cmd, stdout, stderr func(string)) error {
 
 func (s *Service) processTranscription(ctx context.Context, job Job) {
 	s.mutate(job.ID, func(next *Job) { next.Status = "running"; next.Phase = "전사 시작" })
-	_, err := s.transcribeMedia(ctx, job)
+	transcript, err := s.transcribeMedia(ctx, job)
 	if err != nil {
 		s.fail(job.ID, err)
 		return
@@ -126,11 +126,22 @@ func (s *Service) processTranscription(ctx context.Context, job Job) {
 		s.fail(job.ID, err)
 		return
 	}
+	path, err := saveStandaloneTranscript(job.Path, s.Config().OutputDir, transcript)
+	if err != nil {
+		s.fail(job.ID, fmt.Errorf("SRT 저장 실패: %w", err))
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		s.mutate(job.ID, func(next *Job) { next.TranscriptPath = path })
+		s.fail(job.ID, err)
+		return
+	}
 	s.mutate(job.ID, func(next *Job) {
 		now := time.Now().UTC()
 		next.Status = "completed"
 		next.Stage = "completed"
 		next.Phase = "전사 완료"
+		next.TranscriptPath = path
 		next.TranscriptPreview = ""
 		next.CompletedAt = &now
 	})
@@ -335,4 +346,18 @@ func headPreview(value string, n int) string {
 		n--
 	}
 	return value[:n]
+}
+
+func tailPreview(value string, n int) string {
+	if len(value) <= n {
+		return value
+	}
+	start := len(value) - n
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	if line := strings.IndexByte(value[start:], '\n'); line >= 0 {
+		start += line + 1
+	}
+	return value[start:]
 }

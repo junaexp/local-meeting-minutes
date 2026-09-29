@@ -69,6 +69,17 @@ func TestEmptyStateUsesArray(t *testing.T) {
 	}
 }
 
+func TestDeleteFinishedJobsRequiresLocalHeader(t *testing.T) {
+	h, _ := testAPI(t)
+	if got := serve(h, http.MethodDelete, "/api/jobs", nil, nil); got.Code != http.StatusForbidden {
+		t.Fatalf("delete finished jobs did not require local header: %d", got.Code)
+	}
+	got := serve(h, http.MethodDelete, "/api/jobs", nil, map[string]string{"X-Meet-To-MD": "1"})
+	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"deleted":0`) || !strings.Contains(got.Body.String(), `"jobs":[]`) {
+		t.Fatalf("delete finished jobs: %d %s", got.Code, got.Body.String())
+	}
+}
+
 func TestEnvironmentReportsWhisperModelPath(t *testing.T) {
 	h, root := testAPI(t)
 	got := serve(h, "GET", "/api/environment", nil, nil)
@@ -120,6 +131,20 @@ func TestLocalBoundaryAndFileFlow(t *testing.T) {
 	}
 	if got := serve(h, "GET", "/api/state", nil, nil); got.Code != 200 || !strings.Contains(got.Body.String(), "meeting.srt") {
 		t.Fatalf("state: %d %s", got.Code, got.Body.String())
+	}
+	var created struct {
+		Jobs []struct {
+			ID string `json:"id"`
+		} `json:"jobs"`
+	}
+	if err := json.Unmarshal(serve(h, "GET", "/api/state", nil, nil).Body.Bytes(), &created); err != nil || len(created.Jobs) != 1 {
+		t.Fatalf("decode created job: %+v %v", created, err)
+	}
+	if got := serve(h, "GET", "/api/jobs/"+created.Jobs[0].ID, nil, nil); got.Code != 200 || !strings.Contains(got.Body.String(), "meeting.srt") {
+		t.Fatalf("job detail: %d %s", got.Code, got.Body.String())
+	}
+	if got := serve(h, "GET", "/api/jobs/missing", nil, nil); got.Code != 404 {
+		t.Fatalf("missing job detail: %d %s", got.Code, got.Body.String())
 	}
 }
 
