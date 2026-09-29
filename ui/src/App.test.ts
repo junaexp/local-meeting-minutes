@@ -17,6 +17,7 @@ class FakeEventSource {
   constructor(_url: string) { FakeEventSource.latest = this }
   addEventListener(name: string, handler: EventListener) { this.handlers.set(name, handler as (event: MessageEvent) => void) }
   emit(name: string, value: unknown) { this.handlers.get(name)?.({ data: JSON.stringify(value) } as MessageEvent) }
+  fail() { this.onerror?.() }
   close() {}
 }
 
@@ -40,9 +41,89 @@ beforeEach(() => {
   vi.mocked(api.testCodex).mockResolvedValue({ result: 'Hello world!', models: [] })
   vi.mocked(api.installWhisper).mockResolvedValue({ status: 'installing' })
 })
-afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllGlobals() })
+
+function transcriptionJob(status: Job['status'], log = ''): Job {
+  return {
+    id: 'recover-1', kind: 'transcription', path: '/tmp/회의/recover.mp4', name: 'recover.mp4', status,
+    stage: status === 'completed' ? 'completed' : 'transcribing', phase: status === 'completed' ? '전사 완료' : 'Whisper 전사 중',
+    model: '', effort: '', transcriptionModel: 'large-v3-turbo', transcriptionLog: log,
+    result: '', recentOutput: '', outputPath: '', error: '', prompt: '', createdAt: '2026-09-29T00:00:00Z',
+  }
+}
 
 describe('workspace flow', () => {
+  it('recovers the completed job when the live connection fails, then clears the warning on reconnect', async () => {
+    vi.mocked(api.state)
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('running')] })
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('completed', '전사 완료 로그')], whisperReady: true })
+    render(App)
+    await screen.findByText('Whisper 전사 중')
+    FakeEventSource.latest.fail()
+    await waitFor(() => expect(api.state).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('전사 완료')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toContain('실시간 연결을 다시 확인')
+    await fireEvent.click(screen.getByRole('button', { name: '설정 열기' }))
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    FakeEventSource.latest.emit('state', { ...baseState, whisperReady: true, jobs: [transcriptionJob('completed', '전사 완료 로그')] })
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+  })
+  it('shows malformed stream data and restores state through the HTTP endpoint', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(api.state)
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('running')] })
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('completed', '전사 완료 로그')] })
+    render(App)
+    await screen.findByText('Whisper 전사 중')
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: { broken: true } })
+    expect((await screen.findByRole('status')).textContent).toContain('실시간 상태를 읽지 못했습니다')
+    expect(await screen.findByText('전사 완료')).toBeTruthy()
+    expect(console.error).toHaveBeenCalled()
+  })
+  it('checks current job state after stream silence', async () => {
+    let watchdog: (() => void) | undefined
+    const setInterval = window.setInterval.bind(window)
+    vi.spyOn(window, 'setInterval').mockImplementation((handler, timeout, ...args) => {
+      if (timeout === 5_000) { watchdog = handler as () => void; return 987654 as number }
+      return setInterval(handler, timeout, ...args)
+    })
+    vi.mocked(api.state)
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('running')] })
+      .mockResolvedValueOnce({ ...baseState, jobs: [transcriptionJob('completed')] })
+    render(App)
+    await screen.findByText('Whisper 전사 중')
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now + 46_000)
+    watchdog?.()
+    expect(await screen.findByText('전사 완료')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toContain('실시간 연결을 다시 확인')
+  })
+  it('keeps a newer stream state when the initial HTTP response arrives late', async () => {
+    let resolveInitial!: (state: Snapshot) => void
+    vi.mocked(api.state).mockReturnValueOnce(new Promise(resolve => { resolveInitial = resolve }))
+    render(App)
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: [transcriptionJob('completed')] })
+    resolveInitial({ ...baseState, jobs: [transcriptionJob('running')] })
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    expect(screen.getByText('전사 완료')).toBeTruthy()
+    expect(screen.queryByText('Whisper 전사 중')).toBeNull()
+  })
+  it('refreshes the transcription log after the start request even without a stream event', async () => {
+    const media = '/tmp/회의/recover.mp4'
+    vi.mocked(api.state)
+      .mockResolvedValueOnce({ ...baseState, whisperReady: true })
+      .mockResolvedValueOnce({ ...baseState, whisperReady: true, jobs: [transcriptionJob('running', '12:00:00  FFmpeg 음성 추출 시작\n')] })
+    vi.mocked(api.expand).mockResolvedValue({ paths: [media] })
+    vi.mocked(api.preview).mockResolvedValue({ text: '미디어 파일입니다.', transcribed: false })
+    vi.mocked(api.createTranscription).mockResolvedValue({ job: transcriptionJob('running') })
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '폴더 선택' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '현재 폴더 추가' }))
+    await fireEvent.click(await screen.findByRole('button', { name: '전사 시작' }))
+    await waitFor(() => expect(api.state).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect((screen.getByRole('textbox', { name: 'Whisper 전사 로그' }) as HTMLTextAreaElement).value).toContain('FFmpeg 음성 추출 시작'))
+  })
   it('selects a folder, previews content, reorders files and confirms enqueue', async () => {
     render(App)
     await screen.findByDisplayValue('한국어로 회의록 작성')

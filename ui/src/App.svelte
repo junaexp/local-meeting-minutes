@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte'
+  import { afterUpdate, onMount } from 'svelte'
   import { Button } from '$lib/components/ui/button/index.js'
   import { Input } from '$lib/components/ui/input/index.js'
   import { Textarea } from '$lib/components/ui/textarea/index.js'
@@ -21,8 +21,14 @@
   let whisperLogArea: HTMLTextAreaElement
   let installLogArea: HTMLTextAreaElement
   let logAtBottom = true
+  let lastScrolledLog = ''
+  let lastScrolledLogArea: HTMLTextAreaElement | undefined
   let detailLogArea: HTMLTextAreaElement
   let detailLogAtBottom = true
+  let lastScrolledDetailLog = ''
+  let lastScrolledDetailLogArea: HTMLTextAreaElement | undefined
+  let lastScrolledInstallLog = ''
+  let lastScrolledInstallLogArea: HTMLTextAreaElement | undefined
   let detailTranscript = ''
   let model = 'gpt-5.6-sol'
   let effort = 'medium'
@@ -49,6 +55,15 @@
   let dropActive = false
   let notificationsEnabled = false
   let knownCompleted = new Set<string>()
+  let connectionIssue: 'none' | 'stream' | 'invalid' | 'server' = 'none'
+  let lastStateAt = 0
+  let lastStreamAt = Date.now()
+  let streamStateVersion = 0
+  let stateRequestVersion = 0
+  let lastRecoveryAttemptAt = 0
+  let recoveryPending = false
+  let retryRecoveryAfterPending = false
+  let disposed = false
   $: detailJob = state.jobs.find(job => job.id === detailId)
   $: installPercent = state.whisperInstall?.total ? Math.min(100, Math.round(state.whisperInstall.downloaded * 100 / state.whisperInstall.total)) : null
   $: selectedFile = cart.find(file => file.path === selectedPath)
@@ -70,9 +85,25 @@
     if (detail) detailLogAtBottom = pinned
     else logAtBottom = pinned
   }
-  $: if (selectedLog) { void tick().then(() => { if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight }) }
-  $: if (detailLog) { void tick().then(() => { if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight }) }
-  $: if (state.whisperInstall?.log) { void tick().then(() => { if (installLogArea) installLogArea.scrollTop = installLogArea.scrollHeight }) }
+  // Scroll only when the log or its textarea changes; scroll events can trigger another update.
+  afterUpdate(() => {
+    if (selectedLog !== lastScrolledLog || whisperLogArea !== lastScrolledLogArea) {
+      lastScrolledLog = selectedLog
+      lastScrolledLogArea = whisperLogArea
+      if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight
+    }
+    if (detailLog !== lastScrolledDetailLog || detailLogArea !== lastScrolledDetailLogArea) {
+      lastScrolledDetailLog = detailLog
+      lastScrolledDetailLogArea = detailLogArea
+      if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight
+    }
+    const installLog = state.whisperInstall?.log || ''
+    if (installLog !== lastScrolledInstallLog || installLogArea !== lastScrolledInstallLogArea) {
+      lastScrolledInstallLog = installLog
+      lastScrolledInstallLogArea = installLogArea
+      if (installLogArea) installLogArea.scrollTop = installLogArea.scrollHeight
+    }
+  })
   function formatBytes(value: number) { return `${(value / (1024 * 1024)).toFixed(1)} MB` }
   function modelAvailable(id: string) { return !models.length || models.some(item => item.model === id || item.id === id) }
   async function loadModels() {
@@ -81,29 +112,83 @@
   }
 
   function acceptState(next: Snapshot) {
+    if (!next || typeof next !== 'object' || (next.jobs != null && !Array.isArray(next.jobs))) throw new Error('올바르지 않은 작업 상태입니다.')
     next = { ...next, jobs: next.jobs ?? [] }
+    if (next.jobs.some(job => !job || typeof job !== 'object')) throw new Error('올바르지 않은 작업 목록입니다.')
     const whisperChanged = state.whisperReady !== next.whisperReady || (state.whisperInstalling && !next.whisperInstalling)
     const newlyTranscribed = isMedia(selectedPath) && next.jobs.some(job => job.path === selectedPath && hasTranscript(job) && !hasTranscript(state.jobs.find(previous => previous.id === job.id)))
     const detailCompleted = next.jobs.some(job => job.id === detailId && job.kind === 'transcription' && job.status === 'completed' && state.jobs.find(previous => previous.id === job.id)?.status !== 'completed')
-    if (notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-      for (const job of next.jobs) if (job.status === 'completed' && !knownCompleted.has(job.id)) new Notification(job.kind === 'transcription' ? '전사 완료' : '회의록 생성 완료', { body: `${job.name} · ${job.kind === 'transcription' ? '전사문 준비됨' : '저장 완료'}` })
-    }
+    const completedForNotification = notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted'
+      ? next.jobs.filter(job => job.status === 'completed' && !knownCompleted.has(job.id)) : []
     knownCompleted = new Set(next.jobs.filter(job => job.status === 'completed').map(job => job.id))
     state = next
+    for (const job of completedForNotification) {
+      try { new Notification(job.kind === 'transcription' ? '전사 완료' : '회의록 생성 완료', { body: `${job.name} · ${job.kind === 'transcription' ? '전사문 준비됨' : '저장 완료'}` }) }
+      catch (cause) { console.warn('작업 완료 알림을 표시하지 못했습니다.', cause) }
+    }
     if (settingsOpen && whisperChanged) void refreshEnvironment()
     if (newlyTranscribed) void loadPreview(selectedPath)
     if (detailCompleted) void loadDetailTranscript(detailId)
   }
+  async function resyncState(force = false) {
+    const now = Date.now()
+    if (recoveryPending) { if (force) retryRecoveryAfterPending = true; return }
+    if (!force && now - lastRecoveryAttemptAt < 10_000) return
+    lastRecoveryAttemptAt = now
+    recoveryPending = true
+    const streamVersion = streamStateVersion
+    const requestVersion = ++stateRequestVersion
+    try {
+      const next = await api.state()
+      if (disposed || streamVersion !== streamStateVersion || requestVersion !== stateRequestVersion) return
+      acceptState(next)
+      lastStateAt = Date.now()
+      if (connectionIssue === 'server') connectionIssue = 'stream'
+    } catch (cause) {
+      if (!disposed && streamVersion === streamStateVersion && requestVersion === stateRequestVersion) {
+        connectionIssue = 'server'
+        console.error('작업 상태를 다시 읽지 못했습니다.', cause)
+      }
+    } finally {
+      recoveryPending = false
+      if (retryRecoveryAfterPending && !disposed) { retryRecoveryAfterPending = false; void resyncState(true) }
+    }
+  }
   onMount(() => {
-    Promise.all([api.state(), api.config()]).then(([next, cfg]) => {
-      acceptState(next); config = cfg; promptValue = cfg.prompt
-    }).catch(err => error = String(err.message || err))
+    disposed = false
+    const initialRequestVersion = ++stateRequestVersion
+    api.state().then(next => {
+      if (disposed) return
+      if (streamStateVersion === 0 && initialRequestVersion === stateRequestVersion) { acceptState(next); lastStateAt = Date.now() }
+    }).catch(cause => { if (!disposed) { if (streamStateVersion === 0 && initialRequestVersion === stateRequestVersion) connectionIssue = 'server'; console.error('초기 작업 상태를 읽지 못했습니다.', cause) } })
+    api.config().then(cfg => { if (!disposed) { config = cfg; promptValue = cfg.prompt } })
+      .catch(cause => { if (!disposed) error = String((cause as Error).message || cause) })
     loadModels().catch(() => {})
     const stream = new EventSource('/api/events')
-    stream.addEventListener('state', event => { try { acceptState(JSON.parse((event as MessageEvent).data) as Snapshot) } catch { /* retain last state */ } })
-    stream.onerror = () => { error = '서버 연결을 확인 중입니다. 잠시 후 다시 연결합니다.' }
-    stream.onopen = () => { if (error.startsWith('서버 연결')) error = '' }
-    return () => stream.close()
+    stream.addEventListener('state', event => {
+      try {
+        acceptState(JSON.parse((event as MessageEvent).data) as Snapshot)
+        streamStateVersion++
+        lastStreamAt = Date.now()
+        lastStateAt = lastStreamAt
+        connectionIssue = 'none'
+      } catch (cause) {
+        if (connectionIssue !== 'invalid') console.error('실시간 작업 상태를 처리하지 못했습니다.', cause)
+        connectionIssue = 'invalid'
+        void resyncState()
+      }
+    })
+    stream.addEventListener('heartbeat', () => { lastStreamAt = Date.now() })
+    stream.onerror = () => { if (connectionIssue !== 'server') connectionIssue = 'stream'; void resyncState() }
+    const watchdog = window.setInterval(() => {
+      if (Date.now() - lastStreamAt > 45_000) {
+        if (connectionIssue === 'none') connectionIssue = 'stream'
+        void resyncState()
+      } else if (connectionIssue !== 'none') void resyncState()
+    }, 5_000)
+    const onVisibilityChange = () => { if (!document.hidden) void resyncState(true) }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => { disposed = true; window.clearInterval(watchdog); document.removeEventListener('visibilitychange', onVisibilityChange); stream.close() }
   })
   async function loadPreview(path: string) {
     const request = ++previewRequest
@@ -124,7 +209,7 @@
     if (transcriptionBusyPath) return
     transcriptionBusyPath = path; error = ''
     selectFile(path)
-    try { await api.createTranscription(path) }
+    try { await api.createTranscription(path); void resyncState(true) }
     catch (err) { error = (err as Error).message }
     finally { transcriptionBusyPath = '' }
   }
@@ -148,7 +233,7 @@
     if (!cart.length || busy) return
     if (!window.confirm(`${cart.length}개 파일을 표시된 순서대로 회의록으로 정리할까요?`)) return
     busy = true; error = ''
-    try { await api.createJobs(cart.map(file => file.path), model, effort); cart = []; selectedPath = ''; ++previewRequest; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false }
+    try { await api.createJobs(cart.map(file => file.path), model, effort); cart = []; selectedPath = ''; ++previewRequest; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; void resyncState(true) }
     catch (err) { error = (err as Error).message } finally { busy = false }
   }
   async function refreshEnvironment() {
@@ -181,8 +266,8 @@
   }
   async function enableNotifications() { if (!('Notification' in window)) { error = '이 브라우저는 알림을 지원하지 않습니다.'; return }; notificationsEnabled = (await Notification.requestPermission()) === 'granted'; if (!notificationsEnabled) error = '브라우저 알림 권한이 허용되지 않았습니다.' }
   async function copy(value: string) { try { await navigator.clipboard.writeText(value) } catch { error = '복사할 수 없습니다. 브라우저 권한을 확인해 주세요.' } }
-  async function deleteJob(job: Job) { try { await api.deleteJob(job.id); if (detailId === job.id) detailId = '' } catch (err) { error = (err as Error).message } }
-  async function cancelJob(job: Job) { try { await api.cancelJob(job.id) } catch (err) { error = (err as Error).message } }
+  async function deleteJob(job: Job) { try { await api.deleteJob(job.id); if (detailId === job.id) detailId = ''; void resyncState(true) } catch (err) { error = (err as Error).message } }
+  async function cancelJob(job: Job) { try { const next = await api.cancelJob(job.id); stateRequestVersion++; acceptState(next); lastStateAt = Date.now(); void resyncState(true) } catch (err) { error = (err as Error).message } }
   async function loadDetailTranscript(id: string) {
     try { const result = await api.jobTranscript(id); if (detailId === id) detailTranscript = result.text }
     catch { if (detailId === id) detailTranscript = '' }
@@ -198,6 +283,7 @@
     <span class:warn={!state.codexReady} class="status-pill"><span class="dot"></span>{state.codexReady ? 'Codex 로컬 서비스 준비됨' : 'Codex 실행 파일 확인 필요'}</span>
     <Button aria-label="설정 열기" variant="outline" size="sm" onclick={openSettings}>설정</Button>
   </div></header>
+  {#if connectionIssue !== 'none'}<div role="status" class="connection-notice"><span>{connectionIssue === 'server' ? '서버 응답을 받지 못했습니다. 연결을 확인하고 있습니다.' : connectionIssue === 'invalid' ? '실시간 상태를 읽지 못했습니다. 작업 상태를 다시 확인하고 있습니다.' : '실시간 연결을 다시 확인하고 있습니다. 작업 상태는 자동으로 새로 읽습니다.'}</span><Button variant="outline" size="xs" onclick={() => resyncState(true)}>지금 확인</Button></div>{/if}
   {#if error}<div role="alert" class="error" style="margin-bottom:12px">{error} <button class="mini-button" onclick={() => error = ''} aria-label="오류 닫기">닫기</button></div>{/if}
   {#if state.whisperError}<div role="alert" class="error" style="margin-bottom:12px">Whisper 설치 실패: {state.whisperError}</div>{/if}
   <main class="workspace">
@@ -232,7 +318,7 @@
       </div></section>
     <aside class="panel sidebar" aria-label="작업 상태"><div class="sidebar-columns">
       <div class="notice"><div class="section-title">작업 완료 알림</div><p class="compact muted" style="margin:7px 0 0">정리가 끝나면 브라우저 알림으로 알려드릴게요.</p><Button size="sm" disabled={notificationsEnabled} onclick={enableNotifications}>{notificationsEnabled ? '알림 켜짐' : '알림 켜기'}</Button></div>
-      <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div><div class="job-list">{#each activeJobs as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
+      <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div>{#if activeJobs.length && lastStateAt}<p class="tiny muted state-checked">마지막 상태 확인 {new Date(lastStateAt).toLocaleTimeString()}</p>{/if}<div class="job-list">{#each activeJobs as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
       <section><div class="section-top"><h2 class="section-title">완료 목록</h2><span class="tiny muted">{finishedJobs.length}건</span></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || (job.transcriptPath ? `SRT 저장됨 · ${job.error || job.phase}` : job.error || job.phase)}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
     </div></aside>
   </main>

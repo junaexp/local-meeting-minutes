@@ -266,7 +266,7 @@ func (a API) events(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-heartbeat.C:
-			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+			if _, err := io.WriteString(w, "event: heartbeat\ndata: {}\n\n"); err != nil {
 				return
 			}
 			flusher.Flush()
