@@ -54,8 +54,11 @@ h1, h2, h3, strong { font-weight: 500; }
 .drop-zone.active { border-color: var(--primary); background: #edf7f0; }
 .queue-title { display: flex; justify-content: space-between; align-items: center; margin: 17px 0 10px; }
 .cart-list { display: flex; flex-direction: column; gap: 8px; list-style: none; padding: 0; margin: 0; max-height: 470px; overflow: auto; }
-.cart-item { display: flex; align-items: center; gap: 8px; border: 1px solid #e0e5e3; border-radius: 8px; padding: 10px; min-height: 70px; background: #fff; }
+.cart-item { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border: 1px solid #e0e5e3; border-radius: 8px; padding: 10px; min-height: 70px; background: #fff; }
 .cart-item.selected { background: #fbede8; border-color: #ecaa92; }
+.cart-media-actions { flex: 0 0 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-left: 25px; }
+.cart-media-actions .muted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cart-media-actions button { flex: 0 0 auto; }
 .cart-main { flex: 1; min-width: 0; text-align: left; border: 0; background: transparent; padding: 0; color: inherit; }
 .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
 .cart-controls { display: flex; flex-direction: column; gap: 3px; }
@@ -63,6 +66,10 @@ h1, h2, h3, strong { font-weight: 500; }
 .mini-button:hover { background: #e8efec; color: #203a32; } .mini-button:disabled { opacity: .3; cursor: default; }
 .preview-file { border: 1px solid #e0e7e4; border-radius: 9px; background: #f7f9f8; padding: 13px; margin-bottom: 14px; }
 .preview-box { flex: 1; min-height: 330px; white-space: pre-wrap; overflow: auto; border: 1px solid #e0e7e4; background: #f7f9f8; border-radius: 8px; padding: 13px; font-size: 12px; line-height: 1.7; word-break: break-word; }
+.media-preview-box { flex: 0 0 auto; width: 100%; height: min(30vh, 275px); min-height: 220px; resize: none; }
+.media-log-title { margin-top: 16px; margin-bottom: 10px; }
+.media-log { flex: 1; width: 100%; min-height: 220px; resize: none; border: 1px solid #dce4e0; border-radius: 8px; background: #f7f9f8; color: #334b4e; padding: 13px; font-size: 12px; line-height: 1.6; }
+.media-log-hint { margin: 7px 0 0; }
 .prompt-area { flex: 1; min-height: 335px; resize: vertical; line-height: 1.65; }
 .field-label { font-size: 12px; font-weight: 500; margin: 13px 0 6px; display: block; }
 .panel-footer { margin-top: auto; padding-top: 12px; }

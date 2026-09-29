@@ -123,6 +123,51 @@ func TestLocalBoundaryAndFileFlow(t *testing.T) {
 	}
 }
 
+func TestTranscriptionEndpointAcceptsOnlyMediaAndDeduplicates(t *testing.T) {
+	h, root := testAPI(t)
+	textPath := filepath.Join(root, "meeting.txt")
+	mediaPath := filepath.Join(root, "meeting.mp4")
+	if err := os.WriteFile(textPath, []byte("회의 원문"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mediaPath, []byte("media"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	headers := map[string]string{"X-Meet-To-MD": "1"}
+	textBody, _ := json.Marshal(map[string]string{"path": textPath})
+	if got := serve(h, "POST", "/api/transcriptions", textBody, headers); got.Code != 400 {
+		t.Fatalf("text transcription accepted: %d %s", got.Code, got.Body.String())
+	}
+	mediaBody, _ := json.Marshal(map[string]string{"path": mediaPath})
+	first := serve(h, "POST", "/api/transcriptions", mediaBody, headers)
+	second := serve(h, "POST", "/api/transcriptions", mediaBody, headers)
+	if first.Code != 201 || second.Code != 201 {
+		t.Fatalf("transcription create: %d %d", first.Code, second.Code)
+	}
+	var one, two struct {
+		Job struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &one); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &two); err != nil {
+		t.Fatal(err)
+	}
+	if one.Job.ID == "" || one.Job.ID != two.Job.ID || one.Job.Kind != "transcription" {
+		t.Fatalf("duplicate transcription jobs: %+v %+v", one, two)
+	}
+	if got := serve(h, "GET", "/api/jobs/"+one.Job.ID+"/transcript", nil, nil); got.Code != 404 {
+		t.Fatalf("queued job has transcript: %d %s", got.Code, got.Body.String())
+	}
+	preview := serve(h, "GET", "/api/preview?path="+mediaPath, nil, nil)
+	if preview.Code != 200 || !strings.Contains(preview.Body.String(), `"transcribed":false`) {
+		t.Fatalf("media preview state: %d %s", preview.Code, preview.Body.String())
+	}
+}
+
 func TestInvalidConfigAndBrowserPath(t *testing.T) {
 	h, _ := testAPI(t)
 	if got := serve(h, "GET", "/api/browse?path=relative", nil, nil); got.Code != 400 {

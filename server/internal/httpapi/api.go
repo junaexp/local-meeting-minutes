@@ -39,8 +39,10 @@ func (a API) Router() http.Handler {
 		r.Get("/preview", a.preview)
 		r.Post("/import", a.importFile)
 		r.Post("/jobs", a.createJobs)
+		r.Post("/transcriptions", a.createTranscription)
 		r.Delete("/jobs/{id}", a.deleteJob)
 		r.Post("/jobs/{id}/cancel", a.cancelJob)
+		r.Get("/jobs/{id}/transcript", a.jobTranscript)
 		r.Get("/models", a.models)
 		r.Post("/codex/test", a.testCodex)
 		r.Post("/whisper/install", a.installWhisper)
@@ -138,12 +140,12 @@ func (a API) expand(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"paths": paths})
 }
 func (a API) preview(w http.ResponseWriter, r *http.Request) {
-	text, err := a.Service.Preview(r.URL.Query().Get("path"))
+	text, transcribed, err := a.Service.PreviewState(r.URL.Query().Get("path"))
 	if err != nil {
 		bad(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, map[string]string{"text": text})
+	writeJSON(w, 200, map[string]any{"text": text, "transcribed": transcribed})
 }
 func (a API) importFile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1000*1024*1024+1024*1024)
@@ -190,6 +192,33 @@ func (a API) createJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"jobs": jobs})
+}
+func (a API) createTranscription(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(r, &in); err != nil {
+		bad(w, 400, err)
+		return
+	}
+	job, err := a.Service.EnqueueTranscription(in.Path)
+	if err != nil {
+		bad(w, 400, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"job": job})
+}
+func (a API) jobTranscript(w http.ResponseWriter, r *http.Request) {
+	text, err := a.Service.JobTranscript(chi.URLParam(r, "id"))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		bad(w, status, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"text": text})
 }
 func (a API) deleteJob(w http.ResponseWriter, r *http.Request) {
 	if err := a.Service.Delete(chi.URLParam(r, "id")); err != nil {

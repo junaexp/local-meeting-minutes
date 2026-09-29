@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,21 +23,27 @@ var allowedText = map[string]bool{".srt": true, ".vtt": true, ".txt": true, ".md
 var allowedMedia = map[string]bool{".wav": true, ".mp3": true, ".m4a": true, ".mp4": true, ".mov": true, ".ogg": true}
 
 type Job struct {
-	ID           string     `json:"id"`
-	Path         string     `json:"path"`
-	Name         string     `json:"name"`
-	Status       string     `json:"status"`
-	Phase        string     `json:"phase"`
-	Model        string     `json:"model"`
-	Effort       string     `json:"effort"`
-	Result       string     `json:"result"`
-	RecentOutput string     `json:"recentOutput"`
-	OutputPath   string     `json:"outputPath"`
-	Error        string     `json:"error"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	StartedAt    *time.Time `json:"startedAt,omitempty"`
-	CompletedAt  *time.Time `json:"completedAt,omitempty"`
-	Prompt       string     `json:"prompt"`
+	ID                 string     `json:"id"`
+	Kind               string     `json:"kind,omitempty"`
+	Path               string     `json:"path"`
+	Name               string     `json:"name"`
+	Status             string     `json:"status"`
+	Stage              string     `json:"stage,omitempty"`
+	Phase              string     `json:"phase"`
+	Model              string     `json:"model"`
+	Effort             string     `json:"effort"`
+	TranscriptionModel string     `json:"transcriptionModel,omitempty"`
+	TranscriptKey      string     `json:"transcriptKey,omitempty"`
+	TranscriptPreview  string     `json:"transcriptPreview,omitempty"`
+	TranscriptionLog   string     `json:"transcriptionLog,omitempty"`
+	Result             string     `json:"result"`
+	RecentOutput       string     `json:"recentOutput"`
+	OutputPath         string     `json:"outputPath"`
+	Error              string     `json:"error"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	StartedAt          *time.Time `json:"startedAt,omitempty"`
+	CompletedAt        *time.Time `json:"completedAt,omitempty"`
+	Prompt             string     `json:"prompt"`
 }
 
 type Snapshot struct {
@@ -56,6 +61,7 @@ type Service struct {
 	root              string
 	storePath         string
 	runner            codexapp.Runner
+	transcriber       mediaTranscriber
 	jobs              []Job
 	subs              map[chan Snapshot]struct{}
 	wake              chan struct{}
@@ -74,7 +80,7 @@ func New(root, configPath string, runner codexapp.Runner) (*Service, error) {
 	if runner == nil {
 		runner = codexapp.ProcessRunner{}
 	}
-	s := &Service{root: root, configPath: configPath, cfg: cfg, storePath: filepath.Join(root, "server", "data", "jobs.json"), runner: runner, jobs: []Job{}, subs: map[chan Snapshot]struct{}{}, wake: make(chan struct{}, 1)}
+	s := &Service{root: root, configPath: configPath, cfg: cfg, storePath: filepath.Join(root, "server", "data", "jobs.json"), runner: runner, transcriber: processTranscriber{}, jobs: []Job{}, subs: map[chan Snapshot]struct{}{}, wake: make(chan struct{}, 1)}
 	if data, err := os.ReadFile(s.storePath); err == nil {
 		if err := json.Unmarshal(data, &s.jobs); err != nil {
 			return nil, err
@@ -323,7 +329,7 @@ func (s *Service) Enqueue(paths []string, model, effort string) ([]Job, error) {
 	for _, path := range files {
 		buf := make([]byte, 12)
 		_, _ = rand.Read(buf)
-		j := Job{ID: hex.EncodeToString(buf), Path: path, Name: filepath.Base(path), Status: "queued", Phase: "대기 중", Model: model, Effort: effort, Prompt: s.cfg.Prompt, CreatedAt: time.Now().UTC()}
+		j := Job{ID: hex.EncodeToString(buf), Kind: "minutes", Path: path, Name: filepath.Base(path), Status: "queued", Stage: "queued", Phase: "대기 중", Model: model, Effort: effort, TranscriptionModel: s.cfg.WhisperModel, Prompt: s.cfg.Prompt, CreatedAt: time.Now().UTC()}
 		s.jobs = append(s.jobs, j)
 		created = append(created, j)
 	}
@@ -337,6 +343,41 @@ func (s *Service) Enqueue(paths []string, model, effort string) ([]Job, error) {
 	default:
 	}
 	return created, nil
+}
+func (s *Service) EnqueueTranscription(path string) (Job, error) {
+	real, err := validateFile(path)
+	if err != nil {
+		return Job{}, err
+	}
+	if IsText(real) {
+		return Job{}, errors.New("오디오 또는 영상 파일만 전사할 수 있습니다")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, job := range s.jobs {
+		if job.Kind == "transcription" && job.Path == real && job.TranscriptionModel == s.cfg.WhisperModel && (job.Status == "queued" || job.Status == "preparing" || job.Status == "running") {
+			return job, nil
+		}
+	}
+	if len(s.jobs) >= 1000 {
+		return Job{}, errors.New("작업 기록이 가득 찼습니다")
+	}
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		return Job{}, err
+	}
+	job := Job{ID: hex.EncodeToString(buf), Kind: "transcription", Path: real, Name: filepath.Base(real), Status: "queued", Stage: "queued", Phase: "전사 대기 중", TranscriptionModel: s.cfg.WhisperModel, CreatedAt: time.Now().UTC()}
+	s.jobs = append(s.jobs, job)
+	if err := s.persistLocked(); err != nil {
+		s.jobs = s.jobs[:len(s.jobs)-1]
+		return Job{}, err
+	}
+	s.broadcastLocked()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	return job, nil
 }
 func validModelEffort(model, effort string) bool {
 	if model != "gpt-6-astra" && model != "gpt-6-sol" && model != "gpt-5.6-sol" {
@@ -372,6 +413,7 @@ func (s *Service) Cancel(id string) error {
 		}
 		if j.Status == "queued" {
 			j.Status = "cancelled"
+			j.Stage = "cancelled"
 			j.Phase = "취소됨"
 			now := time.Now().UTC()
 			j.CompletedAt = &now
@@ -415,7 +457,11 @@ func (s *Service) Run(ctx context.Context) {
 		}
 		now := time.Now().UTC()
 		s.jobs[idx].Status = "preparing"
-		s.jobs[idx].Phase = "입력 준비 중"
+		if s.jobs[idx].Kind == "transcription" {
+			s.jobs[idx].Phase = "전사 준비 중"
+		} else {
+			s.jobs[idx].Phase = "입력 준비 중"
+		}
 		s.jobs[idx].StartedAt = &now
 		job := s.jobs[idx]
 		_ = s.persistLocked()
@@ -423,7 +469,11 @@ func (s *Service) Run(ctx context.Context) {
 		jobCtx, cancel := context.WithCancel(ctx)
 		s.activeCancel = cancel
 		s.mu.Unlock()
-		s.process(jobCtx, job)
+		if job.Kind == "transcription" {
+			s.processTranscription(jobCtx, job)
+		} else {
+			s.process(jobCtx, job)
+		}
 		cancel()
 		s.mu.Lock()
 		s.activeCancel = nil
@@ -431,8 +481,12 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 func (s *Service) process(ctx context.Context, j Job) {
-	input, err := s.readInput(ctx, j.Path)
+	input, err := s.readInput(ctx, j)
 	if err != nil {
+		s.fail(j.ID, err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
 		s.fail(j.ID, err)
 		return
 	}
@@ -451,7 +505,12 @@ func (s *Service) process(ctx context.Context, j Job) {
 		return
 	}
 	defer os.RemoveAll(codexWork)
-	s.mutate(j.ID, func(next *Job) { next.Status = "running"; next.Phase = "Codex가 회의록을 작성 중" })
+	s.mutate(j.ID, func(next *Job) {
+		next.Status = "running"
+		next.Stage = "drafting"
+		next.Phase = "Codex가 회의록을 작성 중"
+		next.TranscriptPreview = ""
+	})
 	var output string
 	result, err := s.runner.Run(ctx, binary, j.Model, j.Effort, prompt, codexWork, func(e codexapp.Event) {
 		switch e.Method {
@@ -512,6 +571,10 @@ func (s *Service) process(ctx context.Context, j Job) {
 		s.fail(j.ID, errors.New("빈 회의록이 반환되었습니다"))
 		return
 	}
+	if err := ctx.Err(); err != nil {
+		s.fail(j.ID, err)
+		return
+	}
 	outPath, err := saveMinutes(j.Path, cfg.OutputDir, result)
 	if err != nil {
 		s.fail(j.ID, err)
@@ -520,6 +583,7 @@ func (s *Service) process(ctx context.Context, j Job) {
 	s.mutate(j.ID, func(next *Job) {
 		now := time.Now().UTC()
 		next.Status = "completed"
+		next.Stage = "completed"
 		next.Phase = "완료"
 		next.Result = result
 		next.OutputPath = outPath
@@ -531,9 +595,11 @@ func (s *Service) fail(id string, err error) {
 		now := time.Now().UTC()
 		if errors.Is(err, context.Canceled) {
 			j.Status = "cancelled"
+			j.Stage = "cancelled"
 			j.Phase = "취소됨"
 		} else {
 			j.Status = "failed"
+			j.Stage = "failed"
 			j.Phase = "실패"
 			j.Error = err.Error()
 		}
@@ -557,9 +623,9 @@ func (s *Service) appendLog(id, message string) {
 	})
 }
 
-func (s *Service) readInput(ctx context.Context, path string) (string, error) {
-	if IsText(path) {
-		f, err := os.Open(path)
+func (s *Service) readInput(ctx context.Context, job Job) (string, error) {
+	if IsText(job.Path) {
+		f, err := os.Open(job.Path)
 		if err != nil {
 			return "", err
 		}
@@ -573,38 +639,7 @@ func (s *Service) readInput(ctx context.Context, path string) (string, error) {
 		}
 		return string(b), nil
 	}
-	s.mu.RLock()
-	ready := s.whisperReadyLocked()
-	ffmpeg := s.cfg.FFmpegBinary
-	whisperModel := s.cfg.WhisperModel
-	s.mu.RUnlock()
-	if !ready {
-		return "", errors.New("Whisper 모델 또는 실행 파일이 없습니다. 설치 버튼을 눌러주세요")
-	}
-	if _, err := exec.LookPath(ffmpeg); err != nil {
-		return "", errors.New("ffmpeg를 설치하거나 설정에서 경로를 지정해 주세요")
-	}
-	work, err := os.MkdirTemp("", "meet-to-md-audio-*")
-	if err != nil {
-		return "", err
-	}
-	defer os.RemoveAll(work)
-	wav := filepath.Join(work, "audio.wav")
-	cmd := exec.CommandContext(ctx, ffmpeg, "-nostdin", "-y", "-i", path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("ffmpeg 변환 실패: %s", tail(string(out), 1000))
-	}
-	bin := s.whisperBinary()
-	model := filepath.Join(s.root, "whisper", "models", "ggml-"+whisperModel+".bin")
-	cmd = exec.CommandContext(ctx, bin, "-m", model, "-f", wav, "-l", "auto", "-nt")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("Whisper 변환 실패: %w", err)
-	}
-	if len(out) > 2*1024*1024 {
-		return "", errors.New("전사 결과가 2MB를 초과합니다")
-	}
-	return string(out), nil
+	return s.transcribeMedia(ctx, job)
 }
 
 func saveMinutes(source, outputDir, markdown string) (string, error) {
@@ -645,20 +680,35 @@ func saveMinutes(source, outputDir, markdown string) (string, error) {
 }
 
 func (s *Service) Preview(path string) (string, error) {
+	text, _, err := s.PreviewState(path)
+	return text, err
+}
+
+func (s *Service) PreviewState(path string) (string, bool, error) {
 	real, err := validateFile(path)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if !IsText(real) {
-		return "미디어 파일은 전사 후 내용을 볼 수 있습니다.", nil
+		s.mu.RLock()
+		model := s.cfg.WhisperModel
+		s.mu.RUnlock()
+		transcript, ready, err := s.cachedTranscript(real, model)
+		if err != nil {
+			return "", false, err
+		}
+		if ready {
+			return headPreview(transcript, 64*1024), true, nil
+		}
+		return "미디어 파일입니다. 전사를 시작하면 이곳에 전사문이 표시됩니다.", false, nil
 	}
 	f, err := os.Open(real)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, 64*1024))
-	return string(b), err
+	return string(b), false, err
 }
 
 type Entry struct {

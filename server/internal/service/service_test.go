@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -15,8 +16,9 @@ import (
 )
 
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls []string
+	mu      sync.Mutex
+	calls   []string
+	prompts []string
 }
 
 func (f *fakeRunner) ListModels(context.Context, string) ([]codexapp.Model, error) {
@@ -25,6 +27,7 @@ func (f *fakeRunner) ListModels(context.Context, string) ([]codexapp.Model, erro
 func (f *fakeRunner) Run(_ context.Context, _ string, model, effort, prompt, cwd string, notify func(codexapp.Event)) (string, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, filepath.Base(cwd)+":"+model+":"+effort)
+	f.prompts = append(f.prompts, prompt)
 	f.mu.Unlock()
 	if !strings.Contains(prompt, "<transcript>") || !strings.Contains(prompt, "</transcript>") {
 		return "", os.ErrInvalid
@@ -34,6 +37,70 @@ func (f *fakeRunner) Run(_ context.Context, _ string, model, effort, prompt, cwd
 		notify(codexapp.Event{Method: "item/agentMessage/delta", Params: payload})
 	}
 	return "# 회의록\n\n결정 사항 없음", nil
+}
+
+type fakeTranscriber struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	block   chan struct{}
+}
+
+func (f *fakeTranscriber) Run(ctx context.Context, _, _, _, _, outputBase string, emit func(transcriptionEvent)) error {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	emit(transcriptionEvent{Stage: "extracting", Log: "음성 추출 위치 00:00:01"})
+	emit(transcriptionEvent{Stage: "transcribing", Log: "Whisper 전사 시작", Text: "[00:00:01.000 --> 00:00:02.000] 안녕하세요"})
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.block != nil {
+		select {
+		case <-f.block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return os.WriteFile(outputBase+".srt", []byte("1\n00:00:01,000 --> 00:00:02,000\n안녕하세요\n"), 0600)
+}
+
+func setupMedia(t *testing.T) (string, *Service, *fakeRunner, *fakeTranscriber) {
+	t.Helper()
+	root, s, runner := setup(t)
+	bin := filepath.Join(root, "whisper", "build", "bin", "whisper-cli")
+	if runtime.GOOS == "windows" {
+		bin = filepath.Join(root, "whisper", "whisper-cli.exe")
+	}
+	if err := os.MkdirAll(filepath.Dir(bin), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("test binary"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	model := filepath.Join(root, "whisper", "models", "ggml-large-v3-turbo.bin")
+	if err := os.MkdirAll(filepath.Dir(model), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(model, make([]byte, 1000000), 0600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := s.Config()
+	cfg.FFmpegBinary = executable
+	if err := s.UpdateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	transcriber := &fakeTranscriber{}
+	s.transcriber = transcriber
+	media := filepath.Join(root, "meeting.mp4")
+	if err := os.WriteFile(media, []byte("original media"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return media, s, runner, transcriber
 }
 func setup(t *testing.T) (string, *Service, *fakeRunner) {
 	t.Helper()
@@ -180,5 +247,171 @@ func TestPreviewAndTraversalValidation(t *testing.T) {
 	}
 	if _, err := Expand([]string{root, root, root, root}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManualTranscriptionIsReusedAndInvalidated(t *testing.T) {
+	media, s, runner, transcriber := setupMedia(t)
+	manualJob, err := s.EnqueueTranscription(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	waitDone(t, s, 1)
+	preview, ready, err := s.PreviewState(media)
+	if err != nil || !ready || !strings.Contains(preview, "00:00:01,000") {
+		t.Fatalf("cached preview: %q %v %v", preview, ready, err)
+	}
+	reopened, err := New(s.root, s.configPath, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, persisted, err := reopened.PreviewState(media); err != nil || !persisted {
+		t.Fatalf("transcript did not survive service restart: %v %v", persisted, err)
+	}
+	if !strings.Contains(s.Snapshot().Jobs[0].TranscriptionLog, "Whisper 전사 시작") {
+		t.Fatal("transcription log was not retained")
+	}
+	if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s, 2)
+	transcriber.mu.Lock()
+	calls := transcriber.calls
+	transcriber.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("cached transcription was not reused: %d runs", calls)
+	}
+	runner.mu.Lock()
+	prompt := runner.prompts[0]
+	runner.mu.Unlock()
+	if !strings.Contains(prompt, "00:00:01,000") {
+		t.Fatal("timestamped SRT was not sent to Codex")
+	}
+	if err := os.WriteFile(media, []byte("changed media contents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, ready, err = s.PreviewState(media)
+	if err != nil || ready {
+		t.Fatalf("stale transcription was reused: %v %v", ready, err)
+	}
+	if oldTranscript, err := s.JobTranscript(manualJob.ID); err != nil || !strings.Contains(oldTranscript, "안녕하세요") {
+		t.Fatalf("completed job lost its transcript after source changed: %q %v", oldTranscript, err)
+	}
+	if _, err := s.EnqueueTranscription(media); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s, 3)
+	transcriber.mu.Lock()
+	calls = transcriber.calls
+	transcriber.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("changed media was not transcribed again: %d runs", calls)
+	}
+	baseModel := filepath.Join(s.root, "whisper", "models", "ggml-base.bin")
+	if err := os.WriteFile(baseModel, make([]byte, 1000000), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := s.Config()
+	cfg.WhisperModel = "base"
+	if err := s.UpdateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, ready, err = s.PreviewState(media)
+	if err != nil || ready {
+		t.Fatalf("old model cache was reused: %v %v", ready, err)
+	}
+	if _, err := s.EnqueueTranscription(media); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s, 4)
+	transcriber.mu.Lock()
+	calls = transcriber.calls
+	transcriber.mu.Unlock()
+	if calls != 3 {
+		t.Fatalf("new model did not transcribe: %d runs", calls)
+	}
+}
+
+func TestAutomaticMediaTranscriptionStillCreatesMinutes(t *testing.T) {
+	media, s, runner, transcriber := setupMedia(t)
+	if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	waitDone(t, s, 1)
+	job := s.Snapshot().Jobs[0]
+	if job.Kind != "minutes" || job.OutputPath == "" || job.TranscriptKey == "" || !strings.Contains(job.TranscriptionLog, "Whisper 전사 시작") {
+		t.Fatalf("automatic media job: %+v", job)
+	}
+	transcriber.mu.Lock()
+	calls := transcriber.calls
+	transcriber.mu.Unlock()
+	runner.mu.Lock()
+	prompts := len(runner.prompts)
+	runner.mu.Unlock()
+	if calls != 1 || prompts != 1 {
+		t.Fatalf("auto flow ran %d transcriptions and %d Codex turns", calls, prompts)
+	}
+}
+
+func TestQueuedMinutesWaitsForManualTranscription(t *testing.T) {
+	media, s, _, transcriber := setupMedia(t)
+	if _, err := s.EnqueueTranscription(media); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	waitDone(t, s, 2)
+	transcriber.mu.Lock()
+	calls := transcriber.calls
+	transcriber.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("queued minute job repeated transcription: %d", calls)
+	}
+}
+
+func TestCancellingTranscriptionStopsWithoutCache(t *testing.T) {
+	media, s, _, transcriber := setupMedia(t)
+	transcriber.started = make(chan struct{})
+	transcriber.block = make(chan struct{})
+	job, err := s.EnqueueTranscription(media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go s.Run(ctx)
+	select {
+	case <-transcriber.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transcription did not start")
+	}
+	live := s.Snapshot().Jobs[0]
+	if live.Stage != "transcribing" || !strings.Contains(live.TranscriptionLog, "Whisper 전사 시작") || !strings.Contains(live.TranscriptPreview, "안녕하세요") {
+		t.Fatalf("live transcription state missing: %+v", live)
+	}
+	if err := s.Cancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(5 * time.Second)
+	for s.Snapshot().Jobs[0].Status != "cancelled" {
+		select {
+		case <-deadline:
+			t.Fatal("transcription was not cancelled")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	_, ready, err := s.PreviewState(media)
+	if err != nil || ready {
+		t.Fatalf("cancelled transcription left cache: %v %v", ready, err)
 	}
 }
