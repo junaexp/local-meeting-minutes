@@ -34,6 +34,7 @@ type Job struct {
 	Effort             string     `json:"effort"`
 	TranscriptionModel string     `json:"transcriptionModel,omitempty"`
 	TranscriptKey      string     `json:"transcriptKey,omitempty"`
+	TranscriptPath     string     `json:"transcriptPath,omitempty"`
 	TranscriptPreview  string     `json:"transcriptPreview,omitempty"`
 	TranscriptionLog   string     `json:"transcriptionLog,omitempty"`
 	Result             string     `json:"result"`
@@ -47,11 +48,21 @@ type Job struct {
 }
 
 type Snapshot struct {
-	Jobs              []Job  `json:"jobs"`
-	CodexReady        bool   `json:"codexReady"`
-	WhisperReady      bool   `json:"whisperReady"`
-	WhisperInstalling bool   `json:"whisperInstalling"`
-	WhisperError      string `json:"whisperError"`
+	Jobs              []Job           `json:"jobs"`
+	CodexReady        bool            `json:"codexReady"`
+	WhisperReady      bool            `json:"whisperReady"`
+	WhisperInstalling bool            `json:"whisperInstalling"`
+	WhisperError      string          `json:"whisperError"`
+	WhisperInstall    InstallProgress `json:"whisperInstall"`
+}
+
+type InstallProgress struct {
+	Model      string `json:"model"`
+	Stage      string `json:"stage"`
+	Message    string `json:"message"`
+	Downloaded int64  `json:"downloaded"`
+	Total      int64  `json:"total"`
+	Log        string `json:"log"`
 }
 
 type Service struct {
@@ -68,6 +79,8 @@ type Service struct {
 	activeCancel      context.CancelFunc
 	whisperInstalling bool
 	whisperError      string
+	whisperInstall    InstallProgress
+	lastInstallEvent  time.Time
 	lastLiveWrite     time.Time
 	lastLiveEvent     time.Time
 }
@@ -120,7 +133,7 @@ func (s *Service) Snapshot() Snapshot { s.mu.RLock(); defer s.mu.RUnlock(); retu
 func (s *Service) snapshotLocked() Snapshot {
 	jobs := append([]Job{}, s.jobs...)
 	_, err := config.ResolveBinary(s.cfg.CodexBinary)
-	return Snapshot{Jobs: jobs, CodexReady: err == nil, WhisperReady: s.whisperReadyLocked(), WhisperInstalling: s.whisperInstalling, WhisperError: s.whisperError}
+	return Snapshot{Jobs: jobs, CodexReady: err == nil, WhisperReady: s.whisperReadyLocked(), WhisperInstalling: s.whisperInstalling, WhisperError: s.whisperError, WhisperInstall: s.whisperInstall}
 }
 func (s *Service) Subscribe() (<-chan Snapshot, func()) {
 	s.mu.Lock()
@@ -493,6 +506,19 @@ func (s *Service) process(ctx context.Context, j Job) {
 	s.mu.RLock()
 	cfg := s.cfg
 	s.mu.RUnlock()
+	minutesPath := ""
+	if IsVideo(j.Path) {
+		transcriptPath, target, err := saveVideoTranscript(j.Path, cfg.OutputDir, input)
+		if err != nil {
+			s.fail(j.ID, fmt.Errorf("SRT 저장 실패: %w", err))
+			return
+		}
+		minutesPath = target
+		s.mutate(j.ID, func(next *Job) {
+			next.TranscriptPath = transcriptPath
+			next.Phase = "SRT 저장 완료 · 회의록 준비 중"
+		})
+	}
 	binary, err := config.ResolveBinary(cfg.CodexBinary)
 	if err != nil {
 		s.fail(j.ID, err)
@@ -575,7 +601,13 @@ func (s *Service) process(ctx context.Context, j Job) {
 		s.fail(j.ID, err)
 		return
 	}
-	outPath, err := saveMinutes(j.Path, cfg.OutputDir, result)
+	var outPath string
+	if minutesPath != "" {
+		err = writeNewTextFile(minutesPath, result)
+		outPath = minutesPath
+	} else {
+		outPath, err = saveMinutes(j.Path, cfg.OutputDir, result)
+	}
 	if err != nil {
 		s.fail(j.ID, err)
 		return
@@ -597,10 +629,16 @@ func (s *Service) fail(id string, err error) {
 			j.Status = "cancelled"
 			j.Stage = "cancelled"
 			j.Phase = "취소됨"
+			if j.TranscriptPath != "" {
+				j.Phase = "취소됨 · SRT 저장됨"
+			}
 		} else {
 			j.Status = "failed"
 			j.Stage = "failed"
 			j.Phase = "실패"
+			if j.TranscriptPath != "" {
+				j.Phase = "회의록 실패 · SRT 저장됨"
+			}
 			j.Error = err.Error()
 		}
 		j.CompletedAt = &now
@@ -653,30 +691,70 @@ func saveMinutes(source, outputDir, markdown string) (string, error) {
 			name = fmt.Sprintf("%s_%d", base, n+1)
 		}
 		target := filepath.Join(outputDir, name+".md")
-		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		err := writeNewTextFile(target, markdown)
 		if os.IsExist(err) {
 			continue
 		}
 		if err != nil {
 			return "", err
 		}
-		if _, err = f.WriteString(markdown); err != nil {
-			f.Close()
-			os.Remove(target)
-			return "", err
-		}
-		if err = f.Sync(); err != nil {
-			f.Close()
-			os.Remove(target)
-			return "", err
-		}
-		if err = f.Close(); err != nil {
-			os.Remove(target)
-			return "", err
-		}
 		return target, nil
 	}
 	return "", errors.New("사용 가능한 회의록 파일명을 찾지 못했습니다")
+}
+
+func IsVideo(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".mp4" || ext == ".mov"
+}
+
+func saveVideoTranscript(source, outputDir, transcript string) (string, string, error) {
+	if outputDir == "" {
+		outputDir = filepath.Dir(source)
+	}
+	base := strings.TrimSuffix(filepath.Base(source), filepath.Ext(source))
+	for n := 0; n < 1000; n++ {
+		suffix := ""
+		if n > 0 {
+			suffix = fmt.Sprintf("_%d", n+1)
+		}
+		srtPath := filepath.Join(outputDir, base+"_전사"+suffix+".srt")
+		mdPath := filepath.Join(outputDir, base+"_회의록"+suffix+".md")
+		if _, err := os.Stat(mdPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return "", "", err
+		}
+		if err := writeNewTextFile(srtPath, transcript); os.IsExist(err) {
+			continue
+		} else if err != nil {
+			return "", "", err
+		}
+		return srtPath, mdPath, nil
+	}
+	return "", "", errors.New("사용 가능한 SRT·회의록 파일명을 찾지 못했습니다")
+}
+
+func writeNewTextFile(path, content string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func (s *Service) Preview(path string) (string, error) {

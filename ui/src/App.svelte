@@ -19,6 +19,7 @@
   let previewRequest = 0
   let transcriptionBusyPath = ''
   let whisperLogArea: HTMLTextAreaElement
+  let installLogArea: HTMLTextAreaElement
   let logAtBottom = true
   let detailLogArea: HTMLTextAreaElement
   let detailLogAtBottom = true
@@ -49,6 +50,7 @@
   let notificationsEnabled = false
   let knownCompleted = new Set<string>()
   $: detailJob = state.jobs.find(job => job.id === detailId)
+  $: installPercent = state.whisperInstall?.total ? Math.min(100, Math.round(state.whisperInstall.downloaded * 100 / state.whisperInstall.total)) : null
   $: selectedFile = cart.find(file => file.path === selectedPath)
   $: selectedMediaJob = [...state.jobs].reverse().find(job => job.path === selectedPath && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel && (job.kind === 'transcription' || !!job.transcriptionLog))
   $: selectedLog = selectedMediaJob?.transcriptionLog || ''
@@ -70,6 +72,8 @@
   }
   $: if (selectedLog) { void tick().then(() => { if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight }) }
   $: if (detailLog) { void tick().then(() => { if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight }) }
+  $: if (state.whisperInstall?.log) { void tick().then(() => { if (installLogArea) installLogArea.scrollTop = installLogArea.scrollHeight }) }
+  function formatBytes(value: number) { return `${(value / (1024 * 1024)).toFixed(1)} MB` }
   function modelAvailable(id: string) { return !models.length || models.some(item => item.model === id || item.id === id) }
   async function loadModels() {
     const response = await api.models(); models = response.models ?? []
@@ -154,6 +158,11 @@
     finally { environmentLoading = false }
   }
   function openSettings() { settingsDraft = config ? { ...config } : null; testLog = ''; testResult = ''; environment = null; settingsOpen = true; void refreshEnvironment() }
+  async function startWhisperInstall() {
+    if (!settingsOpen && config) openSettings()
+    try { await api.installWhisper() }
+    catch (err) { error = (err as Error).message }
+  }
   async function saveSettings() {
     if (!settingsDraft) return; busy = true; error = ''
     try { const previousModel = config?.whisperModel; config = await api.saveConfig(settingsDraft); promptValue = config.prompt; settingsOpen = false; if (selectedPath && isMedia(selectedPath) && previousModel !== config.whisperModel) await loadPreview(selectedPath); await loadModels() }
@@ -185,7 +194,7 @@
 
 <div class="app-shell">
   <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">M</span><h1>회의록 만들기</h1></div><div class="statuses">
-    <span class:warn={!state.whisperReady} class="status-pill"><span class="dot"></span>{state.whisperReady ? 'Whisper 모델 준비됨' : state.whisperInstalling ? 'Whisper 설치 중' : 'Whisper 모델 미설치'} {#if !state.whisperReady && !state.whisperInstalling}<Button size="xs" onclick={() => api.installWhisper().catch(err => error = err.message)}>설치</Button>{/if}</span>
+    <span class:warn={!state.whisperReady} class="status-pill"><span class="dot"></span>{state.whisperInstalling ? `${state.whisperInstall?.message || 'Whisper 설치 중'}${installPercent === null ? '' : ` · ${installPercent}%`}` : state.whisperReady ? 'Whisper 모델 준비됨' : 'Whisper 모델 미설치'} {#if !state.whisperReady && !state.whisperInstalling}<Button size="xs" onclick={startWhisperInstall}>설치</Button>{/if}</span>
     <span class:warn={!state.codexReady} class="status-pill"><span class="dot"></span>{state.codexReady ? 'Codex 로컬 서비스 준비됨' : 'Codex 실행 파일 확인 필요'}</span>
     <Button aria-label="설정 열기" variant="outline" size="sm" onclick={openSettings}>설정</Button>
   </div></header>
@@ -224,7 +233,7 @@
     <aside class="panel sidebar" aria-label="작업 상태"><div class="sidebar-columns">
       <div class="notice"><div class="section-title">작업 완료 알림</div><p class="compact muted" style="margin:7px 0 0">정리가 끝나면 브라우저 알림으로 알려드릴게요.</p><Button size="sm" disabled={notificationsEnabled} onclick={enableNotifications}>{notificationsEnabled ? '알림 켜짐' : '알림 켜기'}</Button></div>
       <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div><div class="job-list">{#each activeJobs as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
-      <section><div class="section-top"><h2 class="section-title">완료 목록</h2><span class="tiny muted">{finishedJobs.length}건</span></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || job.error || job.phase}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
+      <section><div class="section-top"><h2 class="section-title">완료 목록</h2><span class="tiny muted">{finishedJobs.length}건</span></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || (job.transcriptPath ? `SRT 저장됨 · ${job.error || job.phase}` : job.error || job.phase)}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
     </div></aside>
   </main>
 </div>
@@ -267,6 +276,18 @@
         <div class="resolved-info"><span>현재 경로</span><code>{environment?.ffmpeg.path || '찾지 못했습니다'}</code></div>
       </div>
     </div>
+    {#if state.whisperInstalling || state.whisperInstall?.stage === 'completed' || state.whisperInstall?.stage === 'failed'}
+      <div class="install-panel" aria-live="polite">
+        <div class="settings-field-head"><h3>Whisper 설치</h3><span class="tiny muted">모델: {state.whisperInstall?.model || '확인 중'}</span></div>
+        <p class="settings-hint">{state.whisperInstall?.message || '설치 준비 중'}{#if state.whisperInstalling && state.whisperInstall?.downloaded}{` · ${formatBytes(state.whisperInstall.downloaded)}${state.whisperInstall.total ? ` / ${formatBytes(state.whisperInstall.total)}` : ''}`}{/if}</p>
+        {#if state.whisperInstalling}
+          {#if installPercent !== null}<div class="install-progress" role="progressbar" aria-label="Whisper 설치 다운로드 진행률" aria-valuenow={installPercent} aria-valuemin="0" aria-valuemax="100"><span style:width={`${installPercent}%`}></span></div>
+          {:else}<div class="indeterminate install-indeterminate" aria-label="Whisper 설치 단계 진행 중"></div>{/if}
+        {/if}
+        <textarea class="install-log" aria-label="Whisper 설치 로그" readonly bind:this={installLogArea} value={state.whisperInstall?.log || '설치를 시작하면 로그가 표시됩니다.'}></textarea>
+        {#if state.whisperInstall?.stage === 'failed'}<Button size="sm" onclick={startWhisperInstall}>다시 시도</Button>{/if}
+      </div>
+    {/if}
     <div class="settings-test"><div class="settings-field-head"><h3>실제 응답 테스트</h3><Button size="sm" disabled={testRunning} onclick={testCodex}>{testRunning ? '테스트 중' : 'GPT-5.6 Luna로 테스트'}</Button></div><p class="settings-hint">Hello world!를 보내 실제 응답을 확인합니다. 모델 사용량이 발생할 수 있습니다.</p><div class="log-box" role="log" aria-live="polite">{testLog || '테스트를 실행하면 로그가 여기에 표시됩니다.'}</div>{#if testResult}<div class="success" style="margin-top:8px">모델 응답: {testResult}</div>{/if}</div>
     <Dialog.Footer class="settings-footer"><Button variant="outline" onclick={() => settingsOpen = false}>취소</Button><Button disabled={busy} onclick={saveSettings}>설정 저장</Button></Dialog.Footer>
   {/if}
@@ -276,7 +297,8 @@
   {#if detailJob}<Dialog.Header><Dialog.Title>{detailJob.name}</Dialog.Title><Dialog.Description>{detailJob.phase} · {detailJob.kind === 'transcription' ? `Whisper ${detailJob.transcriptionModel || ''}` : `${detailJob.model} / ${effortName[detailJob.effort]}`}</Dialog.Description></Dialog.Header>
     <div class="modal-grid"><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? '전사문' : 'Codex 결과'}</h3>{#if !detailTranscribing}<Button variant="outline" size="xs" onclick={() => copy(detailJob!.result)}>복사</Button>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? '전사문' : 'Codex 결과'} readonly value={detailTranscribing ? detailJob.transcriptPreview || detailTranscript || '전사문을 기다리는 중입니다.' : detailJob.result || '결과를 기다리는 중입니다.'}></textarea></div><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'}</h3><span class="tiny muted">{isActive(detailJob) ? '실시간' : '작업 로그'}</span></div><textarea class="modal-textarea" aria-label={detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'} readonly bind:this={detailLogArea} onscroll={event => updateScrollPin(event, true)} value={detailLog || detailJob.phase}></textarea></div></div>
     {#if detailJob.error}<div class="error">{detailJob.error}</div>{/if}
-    {#if detailJob.outputPath}<div class="success">저장 위치: {detailJob.outputPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.outputPath)}>경로 복사</Button></div>{/if}
+    {#if detailJob.transcriptPath}<div class="success">SRT 저장 위치: {detailJob.transcriptPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.transcriptPath!)}>경로 복사</Button></div>{/if}
+    {#if detailJob.outputPath}<div class="success">회의록 저장 위치: {detailJob.outputPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.outputPath)}>경로 복사</Button></div>{/if}
     <details class="modal-section"><summary>요청 정보</summary><p class="compact muted">원본: {detailJob.path}</p><p class="compact muted">Whisper 모델: {detailJob.transcriptionModel || '설정값'}</p>{#if detailJob.kind !== 'transcription'}<p class="compact muted">Codex 모델: {detailJob.model} · {effortName[detailJob.effort]}</p><Textarea readonly value={detailJob.prompt} aria-label="전송 프롬프트" class="w-full min-h-36" />{#if detailJob.transcriptionLog}<p class="compact muted">전사 로그</p><Textarea readonly value={detailJob.transcriptionLog} aria-label="전사 로그 기록" class="w-full min-h-36" />{/if}{/if}</details>
     <Dialog.Footer>{#if ['running','preparing','queued'].includes(detailJob.status)}<Button variant="destructive" onclick={() => cancelJob(detailJob!)}>작업 취소</Button>{:else}<Button variant="outline" onclick={() => deleteJob(detailJob!)}>목록에서 삭제</Button>{/if}<Button onclick={() => detailId = ''}>닫기</Button></Dialog.Footer>
   {/if}

@@ -96,6 +96,13 @@ h1, h2, h3, strong { font-weight: 500; }
 .settings-field input, .settings-field select { width: 100%; }
 .settings-hint { margin: 7px 0 0; color: var(--muted-foreground); font-size: 12.5px; line-height: 1.45; }
 .tool-card { border: 1px solid var(--border); border-radius: 9px; background: #f8faf9; padding: 14px; }
+.install-panel { border: 1px solid var(--border); border-radius: 9px; background: #f8faf9; padding: 14px; margin-top: 14px; }
+.install-panel h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.install-progress { height: 6px; border-radius: 999px; overflow: hidden; background: #dce8e1; margin-top: 12px; }
+.install-progress > span { display: block; height: 100%; background: var(--primary); transition: width .2s ease; }
+.install-indeterminate { margin-top: 12px; height: 6px; }
+.install-log { display: block; width: 100%; height: 140px; resize: vertical; margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: #223238; color: #e3f2ec; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.install-panel > button { margin-top: 10px; }
 .env-status { white-space: nowrap; border-radius: 999px; padding: 3px 8px; background: #fbeee9; color: #ab4d2e; font-size: 11px; font-weight: 600; }
 .env-status.ready { background: #e6f3eb; color: #246e4f; }
 .resolved-info { display: grid; grid-template-columns: 82px minmax(0, 1fr); align-items: start; gap: 8px; margin-top: 9px; font-size: 12px; line-height: 1.45; }

@@ -2,10 +2,11 @@ export type JobStatus = 'queued' | 'preparing' | 'running' | 'completed' | 'fail
 export interface Job {
   id: string; kind?: 'minutes' | 'transcription'; path: string; name: string; status: JobStatus; stage?: string; phase: string
   model: string; effort: string; result: string; recentOutput: string
-  transcriptionModel?: string; transcriptKey?: string; transcriptPreview?: string; transcriptionLog?: string
+  transcriptionModel?: string; transcriptKey?: string; transcriptPath?: string; transcriptPreview?: string; transcriptionLog?: string
   outputPath: string; error: string; createdAt: string; startedAt?: string; completedAt?: string; prompt: string
 }
-export interface Snapshot { jobs: Job[]; codexReady: boolean; whisperReady: boolean; whisperInstalling: boolean; whisperError: string }
+export interface InstallProgress { model: string; stage: string; message: string; downloaded: number; total: number; log: string }
+export interface Snapshot { jobs: Job[]; codexReady: boolean; whisperReady: boolean; whisperInstalling: boolean; whisperError: string; whisperInstall?: InstallProgress }
 export interface Config { listen: string; codexBinary: string; outputDir: string; whisperModel: string; ffmpegBinary: string; prompt: string }
 export interface BinaryEnvironment { path: string; ready: boolean; version?: string; error?: string }
 export interface Environment {

@@ -38,6 +38,7 @@ beforeEach(() => {
   vi.mocked(api.jobTranscript).mockResolvedValue({ text: '1\n00:00:01,000 --> 00:00:02,000\n안녕하세요' })
   vi.mocked(api.createJobs).mockResolvedValue({ jobs: [] })
   vi.mocked(api.testCodex).mockResolvedValue({ result: 'Hello world!', models: [] })
+  vi.mocked(api.installWhisper).mockResolvedValue({ status: 'installing' })
 })
 afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 
@@ -66,6 +67,25 @@ describe('workspace flow', () => {
     await waitFor(() => expect(api.testCodex).toHaveBeenCalledWith('gpt-5.6-luna'))
     expect(await screen.findByText('모델 응답: Hello world!')).toBeTruthy()
   })
+  it('shows Whisper installation bytes, model and live log', async () => {
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '설치' }))
+    await waitFor(() => expect(api.installWhisper).toHaveBeenCalled())
+    await screen.findByRole('dialog')
+    FakeEventSource.latest.emit('state', {
+      ...baseState, whisperInstalling: true,
+      whisperInstall: { model: 'large-v3-turbo', stage: 'model_download', message: 'Whisper large-v3-turbo 모델 다운로드 중', downloaded: 50, total: 100, log: '다운로드 시작\n' },
+    })
+    expect(await screen.findByText('모델: large-v3-turbo')).toBeTruthy()
+    expect(screen.getByRole('progressbar', { name: 'Whisper 설치 다운로드 진행률' }).getAttribute('aria-valuenow')).toBe('50')
+    expect((screen.getByRole('textbox', { name: 'Whisper 설치 로그' }) as HTMLTextAreaElement).value).toContain('다운로드 시작')
+    FakeEventSource.latest.emit('state', {
+      ...baseState, whisperReady: true,
+      whisperInstall: { model: 'large-v3-turbo', stage: 'completed', message: '설치 완료', downloaded: 0, total: 0, log: '설치 완료\n' },
+    })
+    expect(await screen.findByText('설치 완료')).toBeTruthy()
+  })
   it('shows live Codex result and recent output in the job detail', async () => {
     render(App)
     await screen.findByDisplayValue('한국어로 회의록 작성')
@@ -76,6 +96,18 @@ describe('workspace flow', () => {
     await fireEvent.click(await screen.findByRole('button', { name: /a.srt/ }))
     await waitFor(() => expect((screen.getByRole('textbox', { name: 'Codex 결과' }) as HTMLTextAreaElement).value).toContain('# 회의록'))
     expect((screen.getByRole('textbox', { name: '최근 출력' }) as HTMLTextAreaElement).value).toContain('10:00 작업 시작')
+  })
+  it('shows a saved SRT path when video minutes fail', async () => {
+    render(App)
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: [{
+      id: 'video1', kind: 'minutes', path: '/tmp/회의/meeting.mp4', name: 'meeting.mp4', status: 'failed', phase: '회의록 실패 · SRT 저장됨',
+      model: 'gpt-5.6-sol', effort: 'low', transcriptPath: '/tmp/회의/meeting_전사.srt', result: '', recentOutput: '', outputPath: '',
+      error: 'Codex 실행 파일을 찾을 수 없습니다', prompt: '한국어로 회의록 작성', createdAt: '2026-09-29T00:00:00Z',
+    }] })
+    await fireEvent.click(await screen.findByRole('button', { name: /meeting.mp4/ }))
+    expect(await screen.findByText(/SRT 저장 위치: \/tmp\/회의\/meeting_전사.srt/)).toBeTruthy()
+    expect(screen.getByText('Codex 실행 파일을 찾을 수 없습니다')).toBeTruthy()
   })
   it('starts media transcription and shows file-specific live output', async () => {
     const media = '/tmp/회의/제품회의.mp4'

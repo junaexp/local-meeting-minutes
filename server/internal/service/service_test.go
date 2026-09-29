@@ -345,8 +345,14 @@ func TestAutomaticMediaTranscriptionStillCreatesMinutes(t *testing.T) {
 	go s.Run(ctx)
 	waitDone(t, s, 1)
 	job := s.Snapshot().Jobs[0]
-	if job.Kind != "minutes" || job.OutputPath == "" || job.TranscriptKey == "" || !strings.Contains(job.TranscriptionLog, "Whisper 전사 시작") {
+	if job.Kind != "minutes" || job.OutputPath == "" || job.TranscriptPath == "" || job.TranscriptKey == "" || !strings.Contains(job.TranscriptionLog, "Whisper 전사 시작") {
 		t.Fatalf("automatic media job: %+v", job)
+	}
+	if data, err := os.ReadFile(job.TranscriptPath); err != nil || !strings.Contains(string(data), "00:00:01,000") {
+		t.Fatalf("missing exported SRT: %q %v", data, err)
+	}
+	if filepath.Dir(job.TranscriptPath) != filepath.Dir(job.OutputPath) {
+		t.Fatalf("SRT and Markdown use different output folders: %+v", job)
 	}
 	transcriber.mu.Lock()
 	calls := transcriber.calls
@@ -356,6 +362,87 @@ func TestAutomaticMediaTranscriptionStillCreatesMinutes(t *testing.T) {
 	runner.mu.Unlock()
 	if calls != 1 || prompts != 1 {
 		t.Fatalf("auto flow ran %d transcriptions and %d Codex turns", calls, prompts)
+	}
+}
+
+func TestVideoMinutesExportPairsWithoutOverwriting(t *testing.T) {
+	media, s, _, transcriber := setupMedia(t)
+	outputDir := t.TempDir()
+	cfg := s.Config()
+	cfg.OutputDir = outputDir
+	if err := s.UpdateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	previous := filepath.Join(outputDir, "meeting_회의록.md")
+	if err := os.WriteFile(previous, []byte("기존 회의록"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	for index, suffix := range []string{"_2", "_3"} {
+		if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
+			t.Fatal(err)
+		}
+		waitDone(t, s, index+1)
+		job := s.Snapshot().Jobs[index]
+		wantSRT := filepath.Join(outputDir, "meeting_전사"+suffix+".srt")
+		wantMD := filepath.Join(outputDir, "meeting_회의록"+suffix+".md")
+		if job.TranscriptPath != wantSRT || job.OutputPath != wantMD {
+			t.Fatalf("wrong paired paths: SRT %q, MD %q", job.TranscriptPath, job.OutputPath)
+		}
+		if data, err := os.ReadFile(wantSRT); err != nil || !strings.Contains(string(data), "안녕하세요") {
+			t.Fatalf("SRT: %q %v", data, err)
+		}
+		if data, err := os.ReadFile(wantMD); err != nil || !strings.Contains(string(data), "회의록") {
+			t.Fatalf("Markdown: %q %v", data, err)
+		}
+	}
+	if data, err := os.ReadFile(previous); err != nil || string(data) != "기존 회의록" {
+		t.Fatalf("overwrote previous result: %q %v", data, err)
+	}
+	transcriber.mu.Lock()
+	calls := transcriber.calls
+	transcriber.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("cached SRT was not reused: %d transcriptions", calls)
+	}
+}
+
+func TestVideoTranscriptRemainsWhenMinutesFail(t *testing.T) {
+	media, s, _, _ := setupMedia(t)
+	cfg := s.Config()
+	cfg.CodexBinary = filepath.Join(t.TempDir(), "missing-codex")
+	if err := s.UpdateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue([]string{media}, "gpt-5.6-sol", "low"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	deadline := time.After(5 * time.Second)
+	var job Job
+	for {
+		job = s.Snapshot().Jobs[0]
+		if job.Status == "failed" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("job did not fail: %+v", job)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if job.TranscriptPath == "" || job.OutputPath != "" || !strings.Contains(job.Phase, "SRT 저장됨") {
+		t.Fatalf("unexpected result paths: %+v", job)
+	}
+	if data, err := os.ReadFile(job.TranscriptPath); err != nil || !strings.Contains(string(data), "안녕하세요") {
+		t.Fatalf("SRT did not survive: %q %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(media), "meeting_회의록.md")); !os.IsNotExist(err) {
+		t.Fatalf("Markdown was unexpectedly saved: %v", err)
 	}
 }
 
