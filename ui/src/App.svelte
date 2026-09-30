@@ -1,45 +1,56 @@
 <script lang="ts">
-  import { afterUpdate, onMount } from 'svelte'
-  import { Button } from '$lib/components/ui/button/index.js'
-  import { Input } from '$lib/components/ui/input/index.js'
-  import { Textarea } from '$lib/components/ui/textarea/index.js'
-  import { NativeSelect } from '$lib/components/ui/native-select/index.js'
-  import * as Dialog from '$lib/components/ui/dialog/index.js'
-  import { api, type BrowseResult, type Config, type Environment, type Job, type Model, type Snapshot } from '$lib/api'
-  import { addPaths, attachTranscript, moveFile, removeFile, type CartFile } from '$lib/cart'
+  import { onMount } from 'svelte'
+  import { createSelection } from '$lib/selection'
+  import { createJobDetail } from '$lib/job-detail'
+  import ApplicationHeader from '$lib/components/workspace/ApplicationHeader.svelte'
+  import InputPanel from '$lib/components/workspace/InputPanel.svelte'
+  import PreviewPanel from '$lib/components/workspace/PreviewPanel.svelte'
+  import PromptPanel from '$lib/components/workspace/PromptPanel.svelte'
+  import JobSidebar from '$lib/components/workspace/JobSidebar.svelte'
+  import FileBrowser from '$lib/components/workspace/FileBrowser.svelte'
+  import SettingsDialog from '$lib/components/workspace/SettingsDialog.svelte'
+  import JobDetail from '$lib/components/workspace/JobDetail.svelte'
+  import { api, type Config, type Job, type Model, type Snapshot } from '$lib/api'
+  import {
+    addPaths,
+    attachTranscript,
+    removeFile,
+    canSubmit,
+    syncCartJobs,
+    indexJobs,
+    isMedia,
+    isActive,
+    type CartFile,
+  } from '$lib/cart'
+  import { createCartStorage } from '$lib/cart-storage'
+  import { createCartRecovery } from '$lib/cart-recovery'
+  import { createNotifications } from '$lib/notifications'
+  import { connectState, type ConnectionIssue } from '$lib/live-state'
 
-  let state: Snapshot = { jobs: [], codexReady: false, whisperReady: false, whisperInstalling: false, whisperError: '' }
+  // The root coordinates server data and selection. Panels own their local form/scroll state.
+  let state: Snapshot = {
+    jobs: [],
+    codexReady: false,
+    whisperReady: false,
+    whisperInstalling: false,
+    whisperError: '',
+  }
   let config: Config | null = null
   let promptValue = ''
+  let promptEditing = false
   let cart: CartFile[] = []
-  let cartRestored = false
-  let savedCart = ''
-  let selectedPath = ''
-  let preview = '파일을 선택하면 여기에 원문을 표시합니다.'
-  let previewTranscribed = false
-  let previewLoading = false
-  let previewRequest = 0
+  let mounted = false
+  const cartStorage = createCartStorage()
+  const cartRecovery = createCartRecovery(
+    () => cart,
+    (files) => (cart = files),
+  )
+  const notifications = createNotifications()
+  let connection: ReturnType<typeof connectState> | undefined
+  let connectionIssue: ConnectionIssue = 'none'
+  let lastStateAt = 0
+  let notificationsEnabled = false
   let transcriptionBusyPath = ''
-  let previewArea: HTMLTextAreaElement
-  let whisperLogArea: HTMLTextAreaElement
-  let installLogArea: HTMLTextAreaElement
-  let previewAtBottom = true
-  let logAtBottom = true
-  let lastScrolledPreview = ''
-  let lastScrolledPreviewArea: HTMLTextAreaElement | undefined
-  let lastScrolledLog = ''
-  let lastScrolledLogArea: HTMLTextAreaElement | undefined
-  let detailPreviewArea: HTMLTextAreaElement
-  let detailPreviewAtBottom = true
-  let lastScrolledDetailPreview = ''
-  let lastScrolledDetailPreviewArea: HTMLTextAreaElement | undefined
-  let detailLogArea: HTMLTextAreaElement
-  let detailLogAtBottom = true
-  let lastScrolledDetailLog = ''
-  let lastScrolledDetailLogArea: HTMLTextAreaElement | undefined
-  let lastScrolledInstallLog = ''
-  let lastScrolledInstallLogArea: HTMLTextAreaElement | undefined
-  let detailTranscript = ''
   let model = 'gpt-5.6-sol'
   let effort = 'medium'
   let models: Model[] = []
@@ -48,343 +59,301 @@
   let settingsOpen = false
   let browserOpen = false
   let browserMode: 'file' | 'folder' = 'file'
-  let browser: BrowseResult | null = null
-  let browserPath = ''
-  let browserBusy = false
-  let detailId = ''
-  let detailFullJob: Job | null = null
-  let detailJobRequest = 0
-  let selectedFullMediaJob: Job | null = null
-  let selectedMediaJobRequest = 0
-  let promptEditing = false
-  let settingsDraft: Config | null = null
-  let environment: Environment | null = null
-  let environmentLoading = false
-  let environmentError = ''
-  let testLog = ''
-  let testRunning = false
-  let testResult = ''
-  let uploadInput: HTMLInputElement
-  let dragIndex = -1
-  let dropActive = false
-  let notificationsEnabled = false
-  let knownCompleted = new Set<string>()
-  let knownCompletedInitialized = false
   let clearingFinished = false
   let cancellingIds = new Set<string>()
   const cancelTimers = new Map<string, number>()
-  let connectionIssue: 'none' | 'stream' | 'invalid' | 'server' = 'none'
-  let lastStateAt = 0
-  let lastStreamAt = Date.now()
-  let streamStateVersion = 0
-  let stateRequestVersion = 0
-  let lastRecoveryAttemptAt = 0
-  let recoveryPending = false
-  let retryRecoveryAfterPending = false
-  let disposed = false
-  const notificationStorageKey = 'meet-to-md-notifications-enabled'
-  $: stateDetailJob = state.jobs.find(job => job.id === detailId)
-  $: detailJob = stateDetailJob && !isActive(stateDetailJob) && detailFullJob?.id === detailId ? detailFullJob : stateDetailJob
-  $: installPercent = state.whisperInstall?.total ? Math.min(100, Math.round(state.whisperInstall.downloaded * 100 / state.whisperInstall.total)) : null
-  $: selectedFile = cart.find(file => file.path === selectedPath)
-  $: selectedMediaJob = [...state.jobs].reverse().find(job => job.path === selectedPath && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel && (job.kind === 'transcription' || isMedia(job.path)))
-  $: selectedLog = (selectedMediaJob && !isActive(selectedMediaJob) && selectedFullMediaJob?.id === selectedMediaJob.id ? selectedFullMediaJob.transcriptionLog : selectedMediaJob?.transcriptionLog) || ''
-  $: selectedPreviewText = previewTranscribed ? preview : selectedMediaJob?.transcriptPreview || (previewLoading ? '불러오는 중...' : preview)
-  $: detailTranscribing = detailJob?.kind === 'transcription' || ['extracting', 'transcribing', 'transcribed'].includes(detailJob?.stage || '')
-  $: detailPreviewText = detailTranscribing ? detailJob?.transcriptPreview || detailTranscript || '전사문을 기다리는 중입니다.' : detailJob?.result || '결과를 기다리는 중입니다.'
-  $: detailLog = detailTranscribing ? detailJob?.transcriptionLog || '' : detailJob?.recentOutput || ''
-  $: readyFiles = cart.filter(file => !file.disabled)
-  $: activeJobs = state.jobs.filter(job => ['queued', 'preparing', 'running'].includes(job.status))
-  $: finishedJobs = state.jobs.filter(job => !['queued', 'preparing', 'running'].includes(job.status)).slice().reverse()
-  $: selectedModel = models.find(item => item.model === model || item.id === model)
-  $: efforts = selectedModel?.supportedReasoningEfforts?.map(item => item.reasoningEffort).filter(value => ['low','medium','high','xhigh'].includes(value)) ?? ['low','medium','high','xhigh']
-  const effortName: Record<string,string> = { low: 'Light', medium: 'Medium', high: 'High', xhigh: 'Extra high' }
-  function isMedia(path: string) { return /\.(wav|mp3|m4a|mp4|mov|ogg)$/i.test(path) }
-  function isActive(job?: Job) { return !!job && ['queued', 'preparing', 'running'].includes(job.status) }
-  function hasTranscript(job?: Job) { return !!job && (job.stage === 'transcribed' || (job.kind === 'transcription' && job.status === 'completed') || (!!job.transcriptionLog && ['drafting', 'completed'].includes(job.stage || ''))) }
-  function toggleScrollPin(area: 'preview' | 'log' | 'detail-preview' | 'detail-log') {
-    if (area === 'preview') { previewAtBottom = !previewAtBottom; if (previewAtBottom && previewArea) previewArea.scrollTop = previewArea.scrollHeight }
-    else if (area === 'log') { logAtBottom = !logAtBottom; if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight }
-    else if (area === 'detail-preview') { detailPreviewAtBottom = !detailPreviewAtBottom; if (detailPreviewAtBottom && detailPreviewArea) detailPreviewArea.scrollTop = detailPreviewArea.scrollHeight }
-    else { detailLogAtBottom = !detailLogAtBottom; if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight }
+  const selection = createSelection()
+  const details = createJobDetail(showError)
+  const openDetail = details.open
+  const closeDetail = details.close
+
+  // These computations follow their own inputs; log updates never serialize the cart.
+  $: if (mounted) cartStorage.write(cart)
+  $: readyFiles = cart.filter(canSubmit)
+  $: jobIndex = indexJobs(state.jobs, config?.whisperModel)
+  $: selectedFile = cart.find((file) => file.path === $selection.path)
+  $: selectedMediaJob = jobIndex.media.get($selection.path)
+  $: selectedLog =
+    (selectedMediaJob &&
+    !isActive(selectedMediaJob) &&
+    $selection.fullJob?.id === selectedMediaJob.id
+      ? $selection.fullJob.transcriptionLog
+      : selectedMediaJob?.transcriptionLog) || ''
+  $: selectedPreviewText = $selection.transcribed
+    ? $selection.preview
+    : selectedMediaJob?.transcriptPreview ||
+      ($selection.loading ? '불러오는 중...' : $selection.preview)
+  $: activeJobs = state.jobs.filter(isActive)
+  $: finishedJobs = state.jobs.filter((job) => !isActive(job)).reverse()
+  $: stateDetailJob = state.jobs.find((job) => job.id === $details.id)
+  $: detailJob = stateDetailJob
+    ? isActive(stateDetailJob)
+      ? { ...stateDetailJob, prompt: $details.full?.id === $details.id ? $details.full.prompt : '' }
+      : $details.full?.id === $details.id
+        ? $details.full
+        : stateDetailJob
+    : undefined
+  function showError(message: string) {
+    error = message
   }
-  // Scroll only when the log or its textarea changes; scroll events can trigger another update.
-  afterUpdate(() => {
-    if (cartRestored) {
-      const value = JSON.stringify(cart)
-      if (value !== savedCart) {
-        try { window.localStorage.setItem('meet-to-md-cart-v1', value); savedCart = value }
-        catch { /* The current page can still use its in-memory list. */ }
-      }
-    }
-    if (selectedPreviewText !== lastScrolledPreview || previewArea !== lastScrolledPreviewArea) {
-      lastScrolledPreview = selectedPreviewText
-      lastScrolledPreviewArea = previewArea
-      if (previewAtBottom && previewArea) previewArea.scrollTop = previewArea.scrollHeight
-    }
-    if (selectedLog !== lastScrolledLog || whisperLogArea !== lastScrolledLogArea) {
-      lastScrolledLog = selectedLog
-      lastScrolledLogArea = whisperLogArea
-      if (logAtBottom && whisperLogArea) whisperLogArea.scrollTop = whisperLogArea.scrollHeight
-    }
-    if (detailPreviewText !== lastScrolledDetailPreview || detailPreviewArea !== lastScrolledDetailPreviewArea) {
-      lastScrolledDetailPreview = detailPreviewText
-      lastScrolledDetailPreviewArea = detailPreviewArea
-      if (detailPreviewAtBottom && detailPreviewArea) detailPreviewArea.scrollTop = detailPreviewArea.scrollHeight
-    }
-    if (detailLog !== lastScrolledDetailLog || detailLogArea !== lastScrolledDetailLogArea) {
-      lastScrolledDetailLog = detailLog
-      lastScrolledDetailLogArea = detailLogArea
-      if (detailLogAtBottom && detailLogArea) detailLogArea.scrollTop = detailLogArea.scrollHeight
-    }
-    const installLog = state.whisperInstall?.log || ''
-    if (installLog !== lastScrolledInstallLog || installLogArea !== lastScrolledInstallLogArea) {
-      lastScrolledInstallLog = installLog
-      lastScrolledInstallLogArea = installLogArea
-      if (installLogArea) installLogArea.scrollTop = installLogArea.scrollHeight
-    }
-  })
-  function formatBytes(value: number) { return `${(value / (1024 * 1024)).toFixed(1)} MB` }
-  function modelAvailable(id: string) { return !models.length || models.some(item => item.model === id || item.id === id) }
-  async function loadModels() {
-    const response = await api.models(); models = response.models ?? []
-    if (!modelAvailable(model)) model = modelAvailable('gpt-5.6-sol') ? 'gpt-5.6-sol' : (models[0]?.model || model)
+  function resyncState(force = false) {
+    return connection?.resync(force)
+  }
+  function hasTranscript(job?: Job) {
+    return (
+      !!job &&
+      (job.stage === 'transcribed' ||
+        (job.kind === 'transcription' && job.status === 'completed') ||
+        (!!job.transcriptionLog && ['drafting', 'completed'].includes(job.stage || '')))
+    )
   }
 
   function acceptState(next: Snapshot) {
-    if (!next || typeof next !== 'object' || (next.jobs != null && !Array.isArray(next.jobs))) throw new Error('올바르지 않은 작업 상태입니다.')
+    if (!next || typeof next !== 'object' || (next.jobs != null && !Array.isArray(next.jobs)))
+      throw new Error('올바르지 않은 작업 상태입니다.')
     next = { ...next, jobs: next.jobs ?? [] }
-    if (next.jobs.some(job => !job || typeof job !== 'object')) throw new Error('올바르지 않은 작업 목록입니다.')
-    const previousJobs = new Map(state.jobs.map(job => [job.id, job]))
-    const whisperChanged = state.whisperReady !== next.whisperReady || (state.whisperInstalling && !next.whisperInstalling)
-    const newlyTranscribed = isMedia(selectedPath) && next.jobs.some(job => job.path === selectedPath && hasTranscript(job) && !hasTranscript(previousJobs.get(job.id)))
-    const detailFinished = next.jobs.find(job => job.id === detailId && !isActive(job) && previousJobs.get(job.id)?.status !== job.status)
-    const selectedMediaFinished = isMedia(selectedPath) ? [...next.jobs].reverse().find(job => job.path === selectedPath && !isActive(job) && previousJobs.get(job.id)?.status !== job.status) : undefined
-    let nextCart = cart
+    if (next.jobs.some((job) => !job || typeof job !== 'object'))
+      throw new Error('올바르지 않은 작업 목록입니다.')
+    const previous = new Map(state.jobs.map((job) => [job.id, job]))
+    let nextCart = syncCartJobs(cart, next.jobs)
     for (const job of next.jobs) {
-      if (job.transcriptPath && isMedia(job.path) && previousJobs.get(job.id)?.transcriptPath !== job.transcriptPath) {
+      if (
+        job.transcriptPath &&
+        isMedia(job.path) &&
+        previous.get(job.id)?.transcriptPath !== job.transcriptPath
+      )
         nextCart = attachTranscript(nextCart, job.path, job.transcriptPath)
-      }
       if (cancellingIds.has(job.id) && !isActive(job)) clearCancelling(job.id)
     }
-    if (nextCart !== cart) cart = nextCart
-    const completedForNotification = knownCompletedInitialized && notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted'
-      ? next.jobs.filter(job => job.status === 'completed' && !knownCompleted.has(job.id)) : []
-    knownCompleted = new Set(next.jobs.filter(job => job.status === 'completed').map(job => job.id))
-    knownCompletedInitialized = true
+    const updatedCart = syncCartJobs(nextCart, next.jobs)
+    if (updatedCart !== cart) cart = updatedCart
+    cartRecovery.accept(next.jobs)
+    notifications.accept(next.jobs, notificationsEnabled)
     state = next
-    for (const job of completedForNotification) {
-      try { new Notification(job.kind === 'transcription' ? '전사 완료' : '회의록 생성 완료', { body: `${job.name} · ${job.kind === 'transcription' ? '전사문 준비됨' : '저장 완료'}` }) }
-      catch (cause) { console.warn('작업 완료 알림을 표시하지 못했습니다.', cause) }
-    }
-    if (settingsOpen && whisperChanged) void refreshEnvironment()
-    if (newlyTranscribed) void loadPreview(selectedPath)
-    if (detailFinished) {
-      detailFullJob = null
-      void loadDetailJob(detailFinished.id)
-      if (detailFinished.kind === 'transcription') void loadDetailTranscript(detailFinished.id)
-    }
-    if (selectedMediaFinished) void loadMediaJob(selectedMediaFinished)
+    if (
+      isMedia($selection.path) &&
+      next.jobs.some(
+        (job) =>
+          job.path === $selection.path &&
+          hasTranscript(job) &&
+          !hasTranscript(previous.get(job.id)),
+      )
+    )
+      void selection.load($selection.path)
+    const finished = next.jobs.filter(
+      (job) => !isActive(job) && previous.get(job.id)?.status !== job.status,
+    )
+    const detail = finished.find((job) => job.id === $details.id)
+    if (detail) details.refresh(detail)
+    const selected = finished.filter((job) => job.path === $selection.path).pop()
+    if (selected && isMedia($selection.path)) void selection.loadJob(selected)
   }
-  async function resyncState(force = false) {
-    const now = Date.now()
-    if (recoveryPending) { if (force) retryRecoveryAfterPending = true; return }
-    if (!force && now - lastRecoveryAttemptAt < 10_000) return
-    lastRecoveryAttemptAt = now
-    recoveryPending = true
-    const streamVersion = streamStateVersion
-    const requestVersion = ++stateRequestVersion
-    try {
-      const next = await api.state()
-      if (disposed || streamVersion !== streamStateVersion || requestVersion !== stateRequestVersion) return
-      acceptState(next)
-      lastStateAt = Date.now()
-      if (connectionIssue === 'server') connectionIssue = 'stream'
-    } catch (cause) {
-      if (!disposed && streamVersion === streamStateVersion && requestVersion === stateRequestVersion) {
-        connectionIssue = 'server'
-        console.error('작업 상태를 다시 읽지 못했습니다.', cause)
-      }
-    } finally {
-      recoveryPending = false
-      if (retryRecoveryAfterPending && !disposed) { retryRecoveryAfterPending = false; void resyncState(true) }
-    }
-  }
+
   onMount(() => {
-    disposed = false
-    try {
-      notificationsEnabled = window.localStorage.getItem(notificationStorageKey) === '1' && 'Notification' in window && Notification.permission === 'granted'
-    } catch { notificationsEnabled = false }
-    try {
-      const stored: unknown = JSON.parse(window.localStorage.getItem('meet-to-md-cart-v1') || '[]')
-      if (Array.isArray(stored)) {
-        const seen = new Set<string>()
-        cart = stored.filter((item): item is CartFile => {
-          if (!item || typeof item.path !== 'string' || !item.path || typeof item.name !== 'string' || seen.has(item.path)) return false
-          seen.add(item.path)
-          return true
-        }).slice(0, 200).map(item => ({ path: item.path, name: item.name, disabled: item.disabled === true, sourcePath: typeof item.sourcePath === 'string' ? item.sourcePath : undefined }))
-      }
-    } catch { cart = [] }
-    savedCart = JSON.stringify(cart)
-    cartRestored = true
-    if (cart.length) void selectFile(cart.find(file => !file.disabled)?.path || cart[0].path)
-    const initialRequestVersion = ++stateRequestVersion
-    api.state().then(next => {
-      if (disposed) return
-      if (streamStateVersion === 0 && initialRequestVersion === stateRequestVersion) { acceptState(next); lastStateAt = Date.now() }
-    }).catch(cause => { if (!disposed) { if (streamStateVersion === 0 && initialRequestVersion === stateRequestVersion) connectionIssue = 'server'; console.error('초기 작업 상태를 읽지 못했습니다.', cause) } })
-    api.config().then(cfg => { if (!disposed) { config = cfg; promptValue = cfg.prompt } })
-      .catch(cause => { if (!disposed) error = String((cause as Error).message || cause) })
-    loadModels().catch(() => {})
-    const stream = new EventSource('/api/events')
-    stream.addEventListener('state', event => {
-      try {
-        acceptState(JSON.parse((event as MessageEvent).data) as Snapshot)
-        streamStateVersion++
-        lastStreamAt = Date.now()
-        lastStateAt = lastStreamAt
-        connectionIssue = 'none'
-      } catch (cause) {
-        if (connectionIssue !== 'invalid') console.error('실시간 작업 상태를 처리하지 못했습니다.', cause)
-        connectionIssue = 'invalid'
-        void resyncState()
-      }
-    })
-    stream.addEventListener('heartbeat', () => { lastStreamAt = Date.now() })
-    stream.onerror = () => { if (connectionIssue !== 'server') connectionIssue = 'stream'; void resyncState() }
-    const watchdog = window.setInterval(() => {
-      if (Date.now() - lastStreamAt > 45_000) {
-        if (connectionIssue === 'none') connectionIssue = 'stream'
-        void resyncState()
-      } else if (connectionIssue !== 'none') void resyncState()
-    }, 5_000)
-    const onVisibilityChange = () => { if (!document.hidden) void resyncState(true) }
-    document.addEventListener('visibilitychange', onVisibilityChange)
-    return () => { disposed = true; window.clearInterval(watchdog); for (const timer of cancelTimers.values()) window.clearTimeout(timer); cancelTimers.clear(); document.removeEventListener('visibilitychange', onVisibilityChange); stream.close() }
-  })
-  async function loadPreview(path: string) {
-    const request = ++previewRequest
-    previewLoading = true
-    try {
-      const result = await api.preview(path)
-      if (request === previewRequest && selectedPath === path) { preview = result.text; previewTranscribed = result.transcribed }
-    } catch (err) { if (request === previewRequest && selectedPath === path) preview = (err as Error).message }
-    finally { if (request === previewRequest && selectedPath === path) previewLoading = false }
-  }
-  function selectFile(path: string) {
-    selectedPath = path; preview = ''; previewTranscribed = false; previewAtBottom = true; logAtBottom = true
-    selectedFullMediaJob = null
-    ++selectedMediaJobRequest
-    void loadPreview(path)
-    if (isMedia(path)) {
-      const latest = [...state.jobs].reverse().find(job => job.path === path && !isActive(job))
-      if (latest) void loadMediaJob(latest)
+    mounted = true
+    cart = cartStorage.read()
+    notificationsEnabled = notifications.read()
+    if (cart.length) selectFile(cart.find((file) => !file.disabled)?.path || cart[0].path)
+    connection = connectState(
+      acceptState,
+      (value) => (connectionIssue = value),
+      (value) => (lastStateAt = value),
+    )
+    api
+      .config()
+      .then((value) => {
+        if (mounted) {
+          config = value
+          promptValue = value.prompt
+        }
+      })
+      .catch((cause) => {
+        if (mounted) error = (cause as Error).message
+      })
+    void loadModels().catch(() => {})
+    return () => {
+      mounted = false
+      connection?.dispose()
+      cartRecovery.dispose()
+      selection.dispose()
+      details.dispose()
+      for (const timer of cancelTimers.values()) window.clearTimeout(timer)
+      cancelTimers.clear()
     }
+  })
+
+  async function loadModels() {
+    const result = await api.models()
+    if (!mounted) return
+    models = result.models ?? []
+    if (models.length && !models.some((item) => item.model === model || item.id === model))
+      model = models.some((item) => item.model === 'gpt-5.6-sol') ? 'gpt-5.6-sol' : models[0].model
   }
   function addToCart(paths: string[]) {
-    let next = addPaths(cart, paths)
+    let next = syncCartJobs(addPaths(cart, paths), state.jobs)
     for (const path of paths) {
-      const transcript = [...state.jobs].reverse().find(job => job.path === path && job.transcriptPath)?.transcriptPath
+      const transcript = jobIndex.media.get(path)?.transcriptPath
       if (transcript) next = attachTranscript(next, path, transcript)
     }
     cart = next
-    if (!selectedPath && cart.length) void selectFile(cart[0].path)
+    if (!$selection.path && cart.length) selectFile(cart[0].path)
   }
-  function removeFromCart(path: string) { cart = removeFile(cart, path); if (selectedPath === path) { ++previewRequest; ++selectedMediaJobRequest; selectedPath = ''; selectedFullMediaJob = null; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; if (cart.length) void selectFile(cart.find(file => !file.disabled)?.path || cart[0].path) } }
-  async function startTranscription(path: string) {
-    if (transcriptionBusyPath) return
-    transcriptionBusyPath = path; error = ''
-    selectFile(path)
-    try { await api.createTranscription(path); void resyncState(true) }
-    catch (err) { error = (err as Error).message }
-    finally { transcriptionBusyPath = '' }
+  function selectFile(path: string) {
+    selection.select(path, jobIndex.media.get(path))
+  }
+  function clearCart() {
+    cart = []
+    selection.clear()
+  }
+  function removeFromCart(path: string) {
+    cart = removeFile(cart, path)
+    if ($selection.path !== path) return
+    const remaining = cart
+    clearCart()
+    cart = remaining
+    if (cart.length) selectFile(cart.find((file) => !file.disabled)?.path || cart[0].path)
   }
   async function importFiles(files: FileList | File[]) {
-    if (!files.length) return; busy = true; error = ''
-    try { addToCart((await api.importFiles(files)).paths) } catch (err) { error = (err as Error).message }
-    finally { busy = false; if (uploadInput) uploadInput.value = '' }
+    if (!files.length || busy) return
+    busy = true
+    error = ''
+    try {
+      addToCart((await api.importFiles(files)).paths)
+    } catch (cause) {
+      error = (cause as Error).message
+    } finally {
+      busy = false
+    }
   }
-  async function openBrowser(mode: 'file' | 'folder') { browserMode = mode; browserOpen = true; await browseTo(browser?.path || '') }
-  async function browseTo(path: string) {
-    browserBusy = true; error = ''
-    try { browser = await api.browse(path); browserPath = browser.path } catch (err) { error = (err as Error).message }
-    finally { browserBusy = false }
+  function openBrowser(mode: 'file' | 'folder') {
+    browserMode = mode
+    browserOpen = true
   }
-  async function addBrowserPath(path: string) {
-    browserBusy = true; error = ''
-    try { addToCart((await api.expand([path])).paths); browserOpen = false } catch (err) { error = (err as Error).message }
-    finally { browserBusy = false }
+  async function startTranscription(path: string) {
+    if (transcriptionBusyPath) return
+    transcriptionBusyPath = path
+    error = ''
+    selectFile(path)
+    try {
+      await api.createTranscription(path)
+      void resyncState(true)
+    } catch (cause) {
+      error = (cause as Error).message
+    } finally {
+      transcriptionBusyPath = ''
+    }
+  }
+  async function enqueueMinutes(files: CartFile[]) {
+    busy = true
+    error = ''
+    try {
+      const result = await api.createJobs(
+        files.map((file) => file.path),
+        model,
+        effort,
+      )
+      cart = syncCartJobs(cart, result.jobs)
+      void resyncState(true)
+    } catch (cause) {
+      error = (cause as Error).message
+    } finally {
+      busy = false
+    }
   }
   async function startJobs() {
-    if (!readyFiles.length || busy) return
-    if (!window.confirm(`${readyFiles.length}개 파일을 표시된 순서대로 회의록으로 정리할까요?`)) return
-    busy = true; error = ''
-    try { await api.createJobs(readyFiles.map(file => file.path), model, effort); cart = []; selectedPath = ''; selectedFullMediaJob = null; ++previewRequest; ++selectedMediaJobRequest; preview = '파일을 선택하면 여기에 원문을 표시합니다.'; previewTranscribed = false; void resyncState(true) }
-    catch (err) { error = (err as Error).message } finally { busy = false }
+    if (
+      !readyFiles.length ||
+      busy ||
+      !window.confirm(readyFiles.length + '개 파일을 표시된 순서대로 회의록으로 정리할까요?')
+    )
+      return
+    await enqueueMinutes(readyFiles)
   }
-  async function refreshEnvironment() {
-    environmentLoading = true; environmentError = ''
-    try { environment = await api.environment() }
-    catch (err) { environmentError = (err as Error).message }
-    finally { environmentLoading = false }
+  async function rerunFile(file: CartFile) {
+    if (
+      busy ||
+      isActive(file.minutesJob) ||
+      !window.confirm(file.name + ' 파일을 다시 정리할까요?')
+    )
+      return
+    await enqueueMinutes([file])
   }
-  function openSettings() { settingsDraft = config ? { ...config } : null; testLog = ''; testResult = ''; environment = null; settingsOpen = true; void refreshEnvironment() }
-  async function startWhisperInstall() {
-    if (!settingsOpen && config) openSettings()
-    try { await api.installWhisper() }
-    catch (err) { error = (err as Error).message }
-  }
-  async function saveSettings() {
-    if (!settingsDraft) return; busy = true; error = ''
-    try { const previousModel = config?.whisperModel; config = await api.saveConfig(settingsDraft); promptValue = config.prompt; settingsOpen = false; if (selectedPath && isMedia(selectedPath) && previousModel !== config.whisperModel) await loadPreview(selectedPath); await loadModels() }
-    catch (err) { error = (err as Error).message } finally { busy = false }
+  async function settingsSaved(value: Config) {
+    const previousModel = config?.whisperModel
+    config = value
+    promptValue = value.prompt
+    if (isMedia($selection.path) && previousModel !== value.whisperModel)
+      await selection.load($selection.path)
+    await loadModels()
   }
   async function savePrompt() {
-    if (!config) return; busy = true
-    try { config = await api.saveConfig({ ...config, prompt: promptValue }); promptEditing = false }
-    catch (err) { error = (err as Error).message } finally { busy = false }
+    if (!config || busy) return
+    busy = true
+    try {
+      config = await api.saveConfig({ ...config, prompt: promptValue })
+      promptEditing = false
+    } catch (cause) {
+      error = (cause as Error).message
+    } finally {
+      busy = false
+    }
   }
-  async function testCodex() {
-    testRunning = true; testResult = ''; testLog = `${new Date().toLocaleTimeString()} · Codex app-server 연결\n${new Date().toLocaleTimeString()} · gpt-5.6-luna / low · Hello world! 전송 중...`
-    try { const result = await api.testCodex('gpt-5.6-luna'); testResult = result.result; testLog += `\n${new Date().toLocaleTimeString()} · 응답: ${result.result}\n테스트 완료` }
-    catch (err) { testLog += `\n${new Date().toLocaleTimeString()} · 오류: ${(err as Error).message}` }
-    finally { testRunning = false }
+  async function startWhisperInstall() {
+    settingsOpen = true
+    try {
+      await api.installWhisper()
+    } catch (cause) {
+      error = (cause as Error).message
+    }
   }
   async function toggleNotifications() {
     error = ''
-    if (notificationsEnabled) {
-      notificationsEnabled = false
-      try { window.localStorage.removeItem(notificationStorageKey) } catch { /* The current page still keeps the setting. */ }
-      return
-    }
-    if (!('Notification' in window)) { error = '이 브라우저는 알림을 지원하지 않습니다.'; return }
-    const permission = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission()
-    notificationsEnabled = permission === 'granted'
-    if (notificationsEnabled) {
-      try { window.localStorage.setItem(notificationStorageKey, '1') } catch { /* The current page still keeps the setting. */ }
-    } else {
-      error = permission === 'denied' ? '브라우저 설정에서 알림 권한을 허용해 주세요.' : '브라우저 알림 권한이 허용되지 않았습니다.'
+    try {
+      notificationsEnabled = await notifications.toggle(notificationsEnabled)
+    } catch (cause) {
+      error = (cause as Error).message
     }
   }
-  async function copy(value: string) { try { await navigator.clipboard.writeText(value) } catch { error = '복사할 수 없습니다. 브라우저 권한을 확인해 주세요.' } }
-  async function deleteJob(job: Job) { try { await api.deleteJob(job.id); if (detailId === job.id) closeDetail(); void resyncState(true) } catch (err) { error = (err as Error).message } }
+  async function copy(value: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch {
+      error = '복사할 수 없습니다. 브라우저 권한을 확인해 주세요.'
+    }
+  }
+  async function deleteJob(job: Job) {
+    try {
+      await api.deleteJob(job.id)
+      if ($details.id === job.id) closeDetail()
+      void resyncState(true)
+    } catch (cause) {
+      error = (cause as Error).message
+    }
+  }
   async function clearFinishedJobs() {
-    if (!finishedJobs.length || clearingFinished) return
-    if (!window.confirm('완료·실패·중단 기록을 모두 지울까요?\n생성된 SRT와 Markdown 파일은 삭제되지 않습니다.')) return
-    const closeFinishedDetail = !!detailJob && !isActive(detailJob)
-    clearingFinished = true; error = ''
+    if (
+      !finishedJobs.length ||
+      clearingFinished ||
+      !window.confirm(
+        '완료·실패·중단 기록을 모두 지울까요?\n생성된 SRT와 Markdown 파일은 삭제되지 않습니다.',
+      )
+    )
+      return
+    const close = !!detailJob && !isActive(detailJob)
+    clearingFinished = true
+    error = ''
     try {
       const result = await api.deleteFinishedJobs()
-      if (closeFinishedDetail) closeDetail()
-      stateRequestVersion++
-      acceptState(result.state)
-      lastStateAt = Date.now()
-    } catch (err) { error = (err as Error).message }
-    finally { clearingFinished = false }
+      if (close) closeDetail()
+      connection?.apply(result.state)
+    } catch (cause) {
+      error = (cause as Error).message
+    } finally {
+      clearingFinished = false
+    }
   }
   function clearCancelling(id: string) {
-    cancellingIds = new Set([...cancellingIds].filter(value => value !== id))
+    cancellingIds = new Set([...cancellingIds].filter((value) => value !== id))
     const timer = cancelTimers.get(id)
     if (timer !== undefined) window.clearTimeout(timer)
     cancelTimers.delete(id)
@@ -392,140 +361,97 @@
   async function cancelJob(job: Job) {
     if (cancellingIds.has(job.id)) return
     cancellingIds = new Set(cancellingIds).add(job.id)
-    cancelTimers.set(job.id, window.setTimeout(() => clearCancelling(job.id), 15_000))
-    try { const next = await api.cancelJob(job.id); stateRequestVersion++; acceptState(next); lastStateAt = Date.now(); void resyncState(true) }
-    catch (err) { clearCancelling(job.id); error = (err as Error).message }
+    cancelTimers.set(
+      job.id,
+      window.setTimeout(() => clearCancelling(job.id), 15_000),
+    )
+    try {
+      connection?.apply(await api.cancelJob(job.id))
+      void resyncState(true)
+    } catch (cause) {
+      clearCancelling(job.id)
+      error = (cause as Error).message
+    }
   }
-  async function loadDetailTranscript(id: string) {
-    try { const result = await api.jobTranscript(id); if (detailId === id) detailTranscript = result.text }
-    catch { if (detailId === id) detailTranscript = '' }
-  }
-  async function loadDetailJob(id: string) {
-    const request = ++detailJobRequest
-    try { const job = await api.job(id); if (detailId === id && request === detailJobRequest) detailFullJob = job }
-    catch (cause) { if (detailId === id && request === detailJobRequest) error = `작업 상세 정보를 읽지 못했습니다: ${(cause as Error).message}` }
-  }
-  async function loadMediaJob(job: Job) {
-    const request = ++selectedMediaJobRequest
-    try { const full = await api.job(job.id); if (selectedPath === job.path && request === selectedMediaJobRequest) selectedFullMediaJob = full }
-    catch { /* Live status and the saved SRT remain available. */ }
-  }
-  function openDetail(job: Job) { detailId = job.id; detailFullJob = null; ++detailJobRequest; detailTranscript = ''; detailPreviewAtBottom = true; detailLogAtBottom = true; if (!isActive(job)) void loadDetailJob(job.id); if (job.kind === 'transcription' || ['extracting', 'transcribing', 'transcribed'].includes(job.stage || '')) void loadDetailTranscript(job.id) }
-  function closeDetail() { detailId = ''; detailFullJob = null; detailTranscript = ''; ++detailJobRequest }
-  function onDrop(event: DragEvent) { event.preventDefault(); dropActive = false; if (event.dataTransfer?.files.length) void importFiles(event.dataTransfer.files) }
-  function onCartDrop(event: DragEvent, index: number) { event.preventDefault(); cart = moveFile(cart, dragIndex, index); dragIndex = -1 }
 </script>
 
 <div class="app-shell">
-  <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">M</span><h1>회의록 만들기</h1></div><div class="statuses">
-    <span class:warn={!state.whisperReady} class="status-pill"><span class="dot"></span>{state.whisperInstalling ? `${state.whisperInstall?.message || 'Whisper 설치 중'}${installPercent === null ? '' : ` · ${installPercent}%`}` : state.whisperReady ? 'Whisper 모델 준비됨' : 'Whisper 모델 미설치'} {#if !state.whisperReady && !state.whisperInstalling}<Button size="xs" onclick={startWhisperInstall}>설치</Button>{/if}</span>
-    <span class:warn={!state.codexReady} class="status-pill"><span class="dot"></span>{state.codexReady ? 'Codex 로컬 서비스 준비됨' : 'Codex 실행 파일 확인 필요'}</span>
-    <Button aria-label="설정 열기" variant="outline" size="sm" onclick={openSettings}>설정</Button>
-  </div></header>
-  {#if connectionIssue !== 'none'}<div role="status" class="connection-notice"><span>{connectionIssue === 'server' ? '서버 응답을 받지 못했습니다. 연결을 확인하고 있습니다.' : connectionIssue === 'invalid' ? '실시간 상태를 읽지 못했습니다. 작업 상태를 다시 확인하고 있습니다.' : '실시간 연결을 다시 확인하고 있습니다. 작업 상태는 자동으로 새로 읽습니다.'}</span><Button variant="outline" size="xs" onclick={() => resyncState(true)}>지금 확인</Button></div>{/if}
-  {#if error}<div role="alert" class="error" style="margin-bottom:12px">{error} <button class="mini-button" onclick={() => error = ''} aria-label="오류 닫기">닫기</button></div>{/if}
-  {#if state.whisperError}<div role="alert" class="error" style="margin-bottom:12px">Whisper 설치 실패: {state.whisperError}</div>{/if}
+  <ApplicationHeader
+    {state}
+    {connectionIssue}
+    bind:error
+    openSettings={() => (settingsOpen = true)}
+    {startWhisperInstall}
+    {resyncState}
+  />
   <main class="workspace">
-    <section class="panel" aria-labelledby="input-title">
-      <div class="section-top"><h2 id="input-title" class="section-number">01 / INPUT</h2><span class="compact muted">{readyFiles.length}개 파일</span></div>
-      <div class="button-row"><Button onclick={() => openBrowser('file')}>파일 선택</Button><Button variant="outline" onclick={() => openBrowser('folder')}>폴더 선택</Button></div>
-      <input aria-label="컴퓨터에서 파일 가져오기" bind:this={uploadInput} hidden type="file" multiple accept=".srt,.vtt,.txt,.md,.wav,.mp3,.m4a,.mp4,.mov,.ogg" onchange={event => importFiles(event.currentTarget.files || [])} />
-      <button class:active={dropActive} class="drop-zone" ondragover={event => { event.preventDefault(); dropActive = true }} ondragleave={() => dropActive = false} ondrop={onDrop} onclick={() => uploadInput?.click()}>파일을 여기에 끌어놓거나 컴퓨터에서 가져오기<br /><span class="tiny muted">SRT · VTT · TXT · MD · 오디오 · 영상</span></button>
-      <div class="queue-title"><h3 class="section-title">처리 순서</h3><span class="tiny muted">끌어서 순서 변경</span></div>
-      {#if cart.length}<ol class="cart-list">{#each cart as file, index (file.path)}<li class:selected={selectedPath === file.path} class:disabled={file.disabled} class="cart-item" draggable={!file.disabled} ondragstart={() => dragIndex = index} ondragover={event => event.preventDefault()} ondrop={event => onCartDrop(event, index)}>
-        <span class="tiny muted">{file.disabled ? '원본' : String(readyFiles.indexOf(file) + 1).padStart(2, '0')}</span><button class="cart-main" onclick={() => selectFile(file.path)} title={file.path}><span class="truncate">{file.name}</span><span class="tiny muted truncate">{file.path}</span></button>
-        <span class="cart-controls"><button class="mini-button" aria-label={`${file.name} 위로`} disabled={file.disabled || index === 0} onclick={() => cart = moveFile(cart, index, index - 1)}>↑</button><button class="mini-button" aria-label={`${file.name} 아래로`} disabled={file.disabled || index === cart.length - 1} onclick={() => cart = moveFile(cart, index, index + 1)}>↓</button></span>
-        <button class="mini-button" aria-label={`${file.name} 삭제`} onclick={() => removeFromCart(file.path)}>×</button>
-        {#if file.disabled}<span class="cart-source-note">전사 완료 · 회의록 처리 제외</span>{/if}
-        {#if isMedia(file.path)}{@const fileJob = [...state.jobs].reverse().find(job => job.path === file.path && job.kind === 'transcription' && (job.transcriptionModel || config?.whisperModel) === config?.whisperModel)}{@const fileReady = selectedPath === file.path && previewTranscribed}
-          <div class="cart-media-actions"><span class="tiny muted">{fileReady ? '전사문 준비됨' : fileJob?.status === 'failed' ? '전사 실패 · 다시 시도 가능' : isActive(fileJob) ? fileJob?.phase : '오디오·영상 전사'}</span>{#if fileJob && isActive(fileJob)}<Button size="xs" variant="destructive" disabled={cancellingIds.has(fileJob.id)} onclick={() => cancelJob(fileJob)}>{cancellingIds.has(fileJob.id) ? '중지 요청 중' : '전사 중지'}</Button>{:else}<Button size="xs" disabled={transcriptionBusyPath === file.path || (!file.disabled && fileReady) || !state.whisperReady} onclick={() => startTranscription(file.path)}>{file.disabled ? '다시 전사' : fileReady ? '전사 완료' : '전사 시작'}</Button>{/if}</div>
-        {/if}
-      </li>{/each}</ol>{:else}<p class="empty">파일을 등록하면 여기에서 순서를 바꿀 수 있습니다.</p>{/if}
-    </section>
-    <section class="panel" aria-labelledby="preview-title"><div class="section-top"><h2 id="preview-title" class="section-number">02 / PREVIEW</h2></div><div class="preview-file"><div class="section-title truncate">{selectedFile?.name || '선택한 파일 없음'}</div><div class="tiny muted truncate">{selectedFile?.path || '왼쪽에서 파일을 선택해 주세요.'}</div></div><div class="section-top"><h3 class="section-title">{selectedFile && isMedia(selectedFile.path) ? '전사문 미리보기' : '텍스트 미리보기'}</h3>{#if selectedFile && isMedia(selectedFile.path)}<button class:active={previewAtBottom} class="scroll-pin" aria-label="전사문 미리보기 하단 고정" aria-pressed={previewAtBottom} onclick={() => toggleScrollPin('preview')}>하단 고정 {previewAtBottom ? '켬' : '끔'}</button>{:else}<span class="tiny muted">앞 64KB 표시</span>{/if}</div>
-      {#if selectedFile && isMedia(selectedFile.path)}
-        <textarea class="preview-box media-preview-box" aria-label="전사문 미리보기" readonly bind:this={previewArea} value={selectedPreviewText}></textarea>
-        <div class="section-top media-log-title"><h3 class="section-title">Whisper 전사 로그</h3><button class:active={logAtBottom} class="scroll-pin" aria-label="Whisper 전사 로그 하단 고정" aria-pressed={logAtBottom} onclick={() => toggleScrollPin('log')}>하단 고정 {logAtBottom ? '켬' : '끔'}</button></div>
-        <textarea class="media-log" aria-label="Whisper 전사 로그" readonly bind:this={whisperLogArea} value={selectedLog || '전사를 시작하면 FFmpeg와 Whisper 실행 내용이 여기에 표시됩니다.'}></textarea>
-        <p class="tiny muted media-log-hint">다른 파일을 선택하면 해당 파일의 로그를 표시합니다.</p>
-      {:else}<div class="preview-box" aria-live="polite">{previewLoading ? '불러오는 중...' : preview}</div>{/if}
-    </section>
-    <section class="panel" aria-labelledby="settings-title"><div class="section-top"><h2 id="settings-title" class="section-number">03 / SETTINGS</h2></div><div class="section-top"><h3 class="section-title">회의록 프롬프트</h3><div class="button-row" style="flex:0 0 auto"><Button variant="outline" size="xs" onclick={() => promptEditing ? savePrompt() : promptEditing = true}>{promptEditing ? '저장' : '수정'}</Button><Button variant="outline" size="xs" onclick={() => copy(promptValue)}>복사</Button></div></div>
-      <Textarea class="prompt-area" aria-label="회의록 프롬프트" readonly={!promptEditing} bind:value={promptValue} />
-      <div class="panel-footer"><label class="field-label" for="model-select">GPT 모델</label><NativeSelect class="w-full" id="model-select" bind:value={model}><option value="gpt-6-astra" disabled={!modelAvailable('gpt-6-astra')}>GPT-6 Astra{modelAvailable('gpt-6-astra') ? '' : ' · CLI 업데이트 필요'}</option><option value="gpt-6-sol" disabled={!modelAvailable('gpt-6-sol')}>GPT-6 Sol{modelAvailable('gpt-6-sol') ? '' : ' · CLI 업데이트 필요'}</option><option value="gpt-5.6-sol" disabled={!modelAvailable('gpt-5.6-sol')}>GPT-5.6 Sol</option></NativeSelect>
-        <label class="field-label" for="effort-select">추론 수준</label><NativeSelect class="w-full" id="effort-select" bind:value={effort}>{#each efforts as value}<option value={value}>{effortName[value]}</option>{/each}</NativeSelect>
-        <Button class="w-full mt-3" size="lg" disabled={!readyFiles.length || busy || !state.codexReady} onclick={startJobs}>회의록 정리 시작</Button><p class="tiny muted" style="text-align:center;margin-top:8px">{readyFiles.length}개 파일을 위에서 정한 순서대로 처리합니다.</p>
-      </div></section>
-    <aside class="panel sidebar" aria-label="작업 상태"><div class="sidebar-columns">
-      <div class="notice"><div class="section-title">작업 완료 알림</div><p class="compact muted" style="margin:7px 0 0">정리가 끝나면 브라우저 알림으로 알려드릴게요.</p><Button size="sm" variant={notificationsEnabled ? 'outline' : 'default'} aria-pressed={notificationsEnabled} onclick={toggleNotifications}>{notificationsEnabled ? '알림 끄기' : '알림 켜기'}</Button></div>
-      <section><div class="section-top"><h2 class="section-title">작업 큐</h2><span class="tiny muted">{activeJobs.length}건</span></div>{#if activeJobs.length && lastStateAt}<p class="tiny muted state-checked">마지막 상태 확인 {new Date(lastStateAt).toLocaleTimeString()}</p>{/if}<div class="job-list">{#each activeJobs as job (job.id)}<div class="job-row"><button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'queued' ? '대기 중' : '진행 중'}</span></div><div class="job-meta truncate">{job.phase}</div>{#if job.status !== 'queued'}<div class="indeterminate" aria-label="작업 진행 중"></div>{/if}</button>{#if job.kind === 'transcription' || (isMedia(job.path) && ['extracting', 'transcribing'].includes(job.stage || ''))}<Button size="xs" variant="destructive" disabled={cancellingIds.has(job.id)} title={job.kind === 'minutes' ? '전사와 회의록 작업을 함께 중지합니다.' : '전사를 중지합니다.'} aria-label={`${job.name} ${job.kind === 'transcription' ? '전사' : '작업'} 중지`} onclick={() => cancelJob(job)}>{cancellingIds.has(job.id) ? '중지 중' : '중지'}</Button>{/if}</div>{:else}<p class="empty">대기 중인 작업이 없습니다.</p>{/each}</div></section>
-      <section><div class="section-top"><h2 class="section-title">완료 목록</h2><div class="section-actions"><span class="tiny muted">{finishedJobs.length}건</span><Button size="xs" variant="destructive" aria-label="완료 기록 지우기" disabled={!finishedJobs.length || clearingFinished} onclick={clearFinishedJobs}>{clearingFinished ? '지우는 중' : '지우기'}</Button></div></div><div class="job-list">{#each finishedJobs.slice(0, 12) as job (job.id)}<button class="job-card" onclick={() => openDetail(job)}><div class="job-active"><span class="truncate">{job.name}</span><span class="tiny">{job.kind === 'transcription' ? '전사' : '회의록'} · {job.status === 'completed' ? '완료' : job.status === 'failed' ? '실패' : '중단'}</span></div><div class="job-meta truncate">{job.outputPath || (job.transcriptPath ? `SRT 저장됨 · ${job.error || job.phase}` : job.error || job.phase)}</div></button>{:else}<p class="empty">완료한 작업이 없습니다.</p>{/each}</div></section>
-    </div></aside>
+    <InputPanel
+      bind:cart
+      selectedPath={$selection.path}
+      previewTranscribed={$selection.transcribed}
+      {transcriptionBusyPath}
+      {busy}
+      codexReady={state.codexReady}
+      whisperReady={state.whisperReady}
+      {cancellingIds}
+      {jobIndex}
+      {selectFile}
+      {removeFromCart}
+      {startTranscription}
+      {cancelJob}
+      {rerunFile}
+      {clearCart}
+      {openBrowser}
+      {importFiles}
+    />
+    <PreviewPanel
+      {selectedFile}
+      previewLoading={$selection.loading}
+      preview={$selection.preview}
+      {selectedPreviewText}
+      {selectedLog}
+    />
+    <PromptPanel
+      bind:promptValue
+      bind:promptEditing
+      bind:model
+      bind:effort
+      {models}
+      readyCount={readyFiles.length}
+      {busy}
+      codexReady={state.codexReady}
+      {savePrompt}
+      {copy}
+      {startJobs}
+    />
+    <JobSidebar
+      {activeJobs}
+      {finishedJobs}
+      {lastStateAt}
+      {notificationsEnabled}
+      {clearingFinished}
+      {cancellingIds}
+      {toggleNotifications}
+      {openDetail}
+      {cancelJob}
+      {clearFinishedJobs}
+    />
   </main>
 </div>
-
-<Dialog.Root bind:open={browserOpen}><Dialog.Content class="!max-w-2xl max-h-[90vh] overflow-auto"><Dialog.Header><Dialog.Title>{browserMode === 'folder' ? '폴더 선택' : '파일 선택'}</Dialog.Title><Dialog.Description>컴퓨터의 폴더를 탐색합니다. 폴더를 추가하면 지원 파일을 이름순으로 등록합니다.</Dialog.Description></Dialog.Header>
-  <div class="button-row"><Input aria-label="폴더 경로" bind:value={browserPath} onkeydown={event => { if (event.key === 'Enter') browseTo(browserPath) }} /><Button variant="outline" onclick={() => browseTo(browserPath)}>이동</Button></div>
-  {#if browser}<div class="button-row"><Button variant="outline" onclick={() => browseTo(browser!.parent)}>상위 폴더</Button>{#if browserMode === 'folder'}<Button onclick={() => addBrowserPath(browser!.path)} disabled={browserBusy}>현재 폴더 추가</Button>{/if}</div><div class="browser-list">{#each browser.entries as entry (entry.path)}<div class="browser-row"><button class="mini-button" onclick={() => entry.isDir ? browseTo(entry.path) : addBrowserPath(entry.path)}>{entry.isDir ? '폴더 · ' : '파일 · '}{entry.name}</button>{#if entry.isDir}<Button size="xs" variant="outline" onclick={() => addBrowserPath(entry.path)}>추가</Button>{/if}</div>{:else}<p class="empty">표시할 파일이 없습니다.</p>{/each}</div>{/if}
-  {#if browserBusy}<p class="muted compact">불러오는 중...</p>{/if}
-</Dialog.Content></Dialog.Root>
-
-<Dialog.Root bind:open={settingsOpen}><Dialog.Content class="settings-dialog !max-w-[900px] w-[calc(100vw-2rem)] max-h-[90vh] overflow-auto"><Dialog.Header><Dialog.Title>설정</Dialog.Title></Dialog.Header>
-  {#if settingsDraft}
-    <div class="settings-heading"><h3>실행 환경</h3><Button variant="outline" size="xs" disabled={environmentLoading} onclick={refreshEnvironment}>{environmentLoading ? '확인 중' : '재검색'}</Button></div>
-    {#if environmentError}<div class="error" role="alert">환경 정보를 읽지 못했습니다: {environmentError}</div>{/if}
-    <div class="settings-fields">
-      <div class="settings-field">
-        <div class="settings-field-head"><label class="field-label" for="codex-path">Codex 실행 파일</label><span class="env-status" class:ready={environment?.codex.ready}>{environmentLoading ? '확인 중' : environment?.codex.ready ? '탐색됨' : '확인 필요'}</span></div>
-        <Input id="codex-path" bind:value={settingsDraft.codexBinary} placeholder="codex 또는 실행 파일 절대경로" />
-        <p class="settings-hint">PATH에서 자동 탐색합니다. 경로를 직접 지정할 수도 있습니다.</p>
-        <div class="resolved-info"><span>현재 경로</span><code>{environment?.codex.path || environment?.codex.error || '확인 중'}</code></div>
-      </div>
-      <div class="settings-field">
-        <label class="field-label" for="output-dir">회의록 저장 폴더</label>
-        <Input id="output-dir" bind:value={settingsDraft.outputDir} placeholder="비워두면 원본 파일과 같은 폴더" />
-        <p class="settings-hint">비워두면 각 원본 파일 옆에 회의록을 저장합니다.</p>
-      </div>
-    </div>
-    <div class="settings-fields settings-tools">
-      <div class="settings-field tool-card">
-        <div class="settings-field-head"><label class="field-label" for="whisper-model">Whisper 모델</label><span class="env-status" class:ready={environment?.whisper.model === settingsDraft.whisperModel && environment?.whisper.modelReady && environment?.whisper.binaryReady}>{environmentLoading ? '확인 중' : !environment ? '확인 필요' : environment.whisper.model !== settingsDraft.whisperModel ? '저장 후 확인' : environment.whisper.modelReady && environment.whisper.binaryReady ? '준비됨' : '설치 필요'}</span></div>
-        <NativeSelect class="w-full" id="whisper-model" bind:value={settingsDraft.whisperModel}><option value="large-v3-turbo">Large V3 Turbo · 다국어</option><option value="base">Base · 다국어</option><option value="small">Small · 다국어</option></NativeSelect>
-        {#if environment && environment.whisper.model !== settingsDraft.whisperModel}<p class="settings-hint">모델 변경은 설정 저장 후 적용됩니다. 현재 적용: {environment.whisper.model}</p>{:else}<p class="settings-hint">현재 적용: {environment?.whisper.model || '확인 중'} · 자동 설치 기준 whisper.cpp {environment?.whisper.installerVersion || '확인 중'}</p>{/if}
-        <div class="resolved-info"><span>모델 파일</span><code>{environment?.whisper.modelPath || '확인 중'}</code></div>
-        <div class="resolved-info"><span>Whisper 실행 파일</span><code>{environment?.whisper.binaryPath || '미설치'}</code></div>
-      </div>
-      <div class="settings-field tool-card">
-        <div class="settings-field-head"><label class="field-label" for="ffmpeg-path">ffmpeg 실행 파일</label><span class="env-status" class:ready={environment?.ffmpeg.ready}>{environmentLoading ? '확인 중' : environment?.ffmpeg.ready ? '탐색됨' : '확인 필요'}</span></div>
-        <Input id="ffmpeg-path" bind:value={settingsDraft.ffmpegBinary} placeholder="ffmpeg 또는 실행 파일 절대경로" />
-        <p class="settings-hint">설치된 버전: {environment?.ffmpeg.version || environment?.ffmpeg.error || '확인 중'}</p>
-        <div class="resolved-info"><span>현재 경로</span><code>{environment?.ffmpeg.path || '찾지 못했습니다'}</code></div>
-      </div>
-    </div>
-    {#if state.whisperInstalling || state.whisperInstall?.stage === 'completed' || state.whisperInstall?.stage === 'failed'}
-      <div class="install-panel" aria-live="polite">
-        <div class="settings-field-head"><h3>Whisper 설치</h3><span class="tiny muted">모델: {state.whisperInstall?.model || '확인 중'}</span></div>
-        <p class="settings-hint">{state.whisperInstall?.message || '설치 준비 중'}{#if state.whisperInstalling && state.whisperInstall?.downloaded}{` · ${formatBytes(state.whisperInstall.downloaded)}${state.whisperInstall.total ? ` / ${formatBytes(state.whisperInstall.total)}` : ''}`}{/if}</p>
-        {#if state.whisperInstalling}
-          {#if installPercent !== null}<div class="install-progress" role="progressbar" aria-label="Whisper 설치 다운로드 진행률" aria-valuenow={installPercent} aria-valuemin="0" aria-valuemax="100"><span style:width={`${installPercent}%`}></span></div>
-          {:else}<div class="indeterminate install-indeterminate" aria-label="Whisper 설치 단계 진행 중"></div>{/if}
-        {/if}
-        <textarea class="install-log" aria-label="Whisper 설치 로그" readonly bind:this={installLogArea} value={state.whisperInstall?.log || '설치를 시작하면 로그가 표시됩니다.'}></textarea>
-        {#if state.whisperInstall?.stage === 'failed'}<Button size="sm" onclick={startWhisperInstall}>다시 시도</Button>{/if}
-      </div>
-    {/if}
-    <div class="settings-test"><div class="settings-field-head"><h3>실제 응답 테스트</h3><Button size="sm" disabled={testRunning} onclick={testCodex}>{testRunning ? '테스트 중' : 'GPT-5.6 Luna로 테스트'}</Button></div><p class="settings-hint">Hello world!를 보내 실제 응답을 확인합니다. 모델 사용량이 발생할 수 있습니다.</p><div class="log-box" role="log" aria-live="polite">{testLog || '테스트를 실행하면 로그가 여기에 표시됩니다.'}</div>{#if testResult}<div class="success" style="margin-top:8px">모델 응답: {testResult}</div>{/if}</div>
-    <Dialog.Footer class="settings-footer"><Button variant="outline" onclick={() => settingsOpen = false}>취소</Button><Button disabled={busy} onclick={saveSettings}>설정 저장</Button></Dialog.Footer>
-  {/if}
-</Dialog.Content></Dialog.Root>
-
-<Dialog.Root open={!!detailJob} onOpenChange={open => { if (!open) closeDetail() }}><Dialog.Content class="!max-w-[1280px] w-[calc(100vw-2rem)] max-h-[92vh] overflow-auto">
-  {#if detailJob}<Dialog.Header><Dialog.Title>{detailJob.name}</Dialog.Title><Dialog.Description>{detailJob.phase} · {detailJob.kind === 'transcription' ? `Whisper ${detailJob.transcriptionModel || ''}` : `${detailJob.model} / ${effortName[detailJob.effort]}`}</Dialog.Description></Dialog.Header>
-    <div class="modal-grid"><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? '전사문' : 'Codex 결과'}</h3>{#if detailTranscribing}<button class:active={detailPreviewAtBottom} class="scroll-pin" aria-label="상세 전사문 하단 고정" aria-pressed={detailPreviewAtBottom} onclick={() => toggleScrollPin('detail-preview')}>하단 고정 {detailPreviewAtBottom ? '켬' : '끔'}</button>{:else}<Button variant="outline" size="xs" onclick={() => copy(detailJob!.result)}>복사</Button>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? '전사문' : 'Codex 결과'} readonly bind:this={detailPreviewArea} value={detailPreviewText}></textarea></div><div><div class="section-top"><h3 class="section-title">{detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'}</h3>{#if detailTranscribing}<button class:active={detailLogAtBottom} class="scroll-pin" aria-label="상세 Whisper 전사 로그 하단 고정" aria-pressed={detailLogAtBottom} onclick={() => toggleScrollPin('detail-log')}>하단 고정 {detailLogAtBottom ? '켬' : '끔'}</button>{:else}<span class="tiny muted">{isActive(detailJob) ? '실시간' : '작업 로그'}</span>{/if}</div><textarea class="modal-textarea" aria-label={detailTranscribing ? 'Whisper 전사 로그' : '최근 출력'} readonly bind:this={detailLogArea} value={detailLog || detailJob.phase}></textarea></div></div>
-    {#if detailJob.error}<div class="error">{detailJob.error}</div>{/if}
-    {#if detailJob.transcriptPath}<div class="success">SRT 저장 위치: {detailJob.transcriptPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.transcriptPath!)}>경로 복사</Button></div>{/if}
-    {#if detailJob.outputPath}<div class="success">회의록 저장 위치: {detailJob.outputPath} <Button size="xs" variant="outline" onclick={() => copy(detailJob!.outputPath)}>경로 복사</Button></div>{/if}
-    <details class="modal-section"><summary>요청 정보</summary><p class="compact muted">원본: {detailJob.path}</p><p class="compact muted">Whisper 모델: {detailJob.transcriptionModel || '설정값'}</p>{#if detailJob.kind !== 'transcription'}<p class="compact muted">Codex 모델: {detailJob.model} · {effortName[detailJob.effort]}</p><Textarea readonly value={detailJob.prompt} aria-label="전송 프롬프트" class="w-full min-h-36" />{#if detailJob.transcriptionLog}<p class="compact muted">전사 로그</p><Textarea readonly value={detailJob.transcriptionLog} aria-label="전사 로그 기록" class="w-full min-h-36" />{/if}{/if}</details>
-    <Dialog.Footer>{#if ['running','preparing','queued'].includes(detailJob.status)}<Button variant="destructive" disabled={cancellingIds.has(detailJob.id)} onclick={() => cancelJob(detailJob!)}>{cancellingIds.has(detailJob.id) ? '중지 요청 중' : '작업 중지'}</Button>{:else}<Button variant="outline" onclick={() => deleteJob(detailJob!)}>목록에서 삭제</Button>{/if}<Button onclick={closeDetail}>닫기</Button></Dialog.Footer>
-  {/if}
-</Dialog.Content></Dialog.Root>
+<FileBrowser bind:open={browserOpen} mode={browserMode} onPaths={addToCart} onError={showError} />
+<SettingsDialog
+  bind:open={settingsOpen}
+  {config}
+  {state}
+  onSaved={settingsSaved}
+  onError={showError}
+/>
+<JobDetail
+  {detailJob}
+  detailTranscript={$details.transcript}
+  {cancellingIds}
+  {copy}
+  {closeDetail}
+  {cancelJob}
+  {deleteJob}
+/>

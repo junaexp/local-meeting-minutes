@@ -21,6 +21,9 @@ type Client struct {
 	errLines chan string
 	writeMu  sync.Mutex
 	nextID   int
+	cancel   context.CancelFunc
+	readers  sync.WaitGroup
+	readErr  error
 }
 
 type Model struct {
@@ -45,6 +48,13 @@ type Runner interface {
 type ProcessRunner struct{}
 
 func start(ctx context.Context, binary string) (*Client, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+		}
+	}()
 	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
 	cmd.Env = os.Environ()
 	in, err := cmd.StdinPipe()
@@ -62,16 +72,26 @@ func start(ctx context.Context, binary string) (*Client, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	c := &Client{cmd: cmd, in: in, lines: make(chan []byte, 128), errLines: make(chan string, 64)}
+	c := &Client{cmd: cmd, in: in, lines: make(chan []byte, 128), errLines: make(chan string, 64), cancel: cancel}
+	started = true
+	c.readers.Add(2)
 	go func() {
+		defer c.readers.Done()
 		defer close(c.lines)
 		s := bufio.NewScanner(out)
 		s.Buffer(make([]byte, 64*1024), 16*1024*1024)
 		for s.Scan() {
-			c.lines <- append([]byte(nil), s.Bytes()...)
+			// Cancellation must also unblock a full channel after its consumer exits.
+			select {
+			case c.lines <- append([]byte(nil), s.Bytes()...):
+			case <-ctx.Done():
+				return
+			}
 		}
+		c.readErr = s.Err()
 	}()
 	go func() {
+		defer c.readers.Done()
 		defer close(c.errLines)
 		s := bufio.NewScanner(stderr)
 		for s.Scan() {
@@ -85,11 +105,23 @@ func start(ctx context.Context, binary string) (*Client, error) {
 }
 
 func (c *Client) close() {
+	if c.cancel != nil {
+		c.cancel()
+	}
 	_ = c.in.Close()
 	if c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
 	}
 	_ = c.cmd.Wait()
+	c.readers.Wait()
+}
+
+// Called only after lines is closed, which also publishes the scanner error.
+func (c *Client) readFailure() error {
+	if c.readErr != nil {
+		return fmt.Errorf("Codex 출력 읽기 실패: %w", c.readErr)
+	}
+	return errors.New("Codex app-server 연결이 종료되었습니다")
 }
 
 func (c *Client) send(v any) error {
@@ -110,7 +142,7 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 			return ctx.Err()
 		case line, ok := <-c.lines:
 			if !ok {
-				return errors.New("Codex app-server 연결이 종료되었습니다")
+				return c.readFailure()
 			}
 			var msg struct {
 				ID     json.RawMessage `json:"id"`
@@ -234,7 +266,7 @@ func (ProcessRunner) Run(ctx context.Context, binary, model, effort, prompt, cwd
 			return text, ctx.Err()
 		case line, ok := <-c.lines:
 			if !ok {
-				return text, errors.New("Codex app-server 연결이 종료되었습니다")
+				return text, c.readFailure()
 			}
 			var msg struct {
 				ID     json.RawMessage `json:"id"`

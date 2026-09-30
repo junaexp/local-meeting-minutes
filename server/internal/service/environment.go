@@ -35,6 +35,10 @@ type Environment struct {
 
 // Environment reports the currently saved configuration, not unsaved UI edits.
 func (s *Service) Environment() Environment {
+	s.refreshReadiness()
+	s.mu.Lock()
+	s.broadcastLocked()
+	s.mu.Unlock()
 	s.mu.RLock()
 	cfg := s.cfg
 	root := s.root

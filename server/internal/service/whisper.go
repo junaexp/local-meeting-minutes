@@ -44,17 +44,6 @@ func (s *Service) whisperBinary() string {
 	}
 	return filepath.Join(base, "build", "bin", "whisper-cli")
 }
-func (s *Service) whisperReadyLocked() bool {
-	if info, err := os.Stat(filepath.Join(s.root, "whisper", "models", "ggml-"+s.cfg.WhisperModel+".bin")); err != nil || info.Size() < 1000000 {
-		return false
-	}
-	bin := s.whisperBinary()
-	if bin == "" {
-		return false
-	}
-	info, err := os.Stat(bin)
-	return err == nil && !info.IsDir()
-}
 func (s *Service) StartWhisperInstall(ctx context.Context) error {
 	s.mu.Lock()
 	if s.whisperInstalling {
@@ -70,6 +59,7 @@ func (s *Service) StartWhisperInstall(ctx context.Context) error {
 	log.Printf("Whisper 설치 시작: %s", model)
 	go func() {
 		err := s.installWhisper(ctx, model)
+		s.refreshReadiness()
 		s.mu.Lock()
 		s.whisperInstalling = false
 		if err != nil {

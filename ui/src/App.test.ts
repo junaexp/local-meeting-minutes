@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import App from './App.svelte'
+// Tests use deterministic local API fixtures; they never invoke paid model requests.
 import { api, type Job, type Snapshot } from '$lib/api'
 
 vi.mock('$lib/api', () => ({ api: {
@@ -11,12 +12,13 @@ vi.mock('$lib/api', () => ({ api: {
 
 class FakeEventSource {
   static latest: FakeEventSource
+  state: Snapshot | undefined
   private handlers = new Map<string, (event: MessageEvent) => void>()
   onerror?: () => void
   onopen?: () => void
   constructor(_url: string) { FakeEventSource.latest = this }
   addEventListener(name: string, handler: EventListener) { this.handlers.set(name, handler as (event: MessageEvent) => void) }
-  emit(name: string, value: unknown) { this.handlers.get(name)?.({ data: JSON.stringify(value) } as MessageEvent) }
+  emit(name: string, value: unknown) { if (name === 'state' && value && Array.isArray((value as Snapshot).jobs)) this.state = value as Snapshot; this.handlers.get(name)?.({ data: JSON.stringify(value) } as MessageEvent) }
   fail() { this.onerror?.() }
   close() {}
 }
@@ -39,6 +41,12 @@ beforeEach(() => {
   vi.mocked(api.preview).mockResolvedValue({ text: '김: 안녕하세요', transcribed: false })
   vi.mocked(api.jobTranscript).mockResolvedValue({ text: '1\n00:00:01,000 --> 00:00:02,000\n안녕하세요' })
   vi.mocked(api.createJobs).mockResolvedValue({ jobs: [] })
+  vi.mocked(api.job).mockImplementation(async id => {
+    const snapshot = FakeEventSource.latest?.state || await api.state()
+    const job = snapshot.jobs.find(item => item.id === id)
+    if (!job) throw new Error('Synthetic job not found')
+    return job
+  })
   vi.mocked(api.testCodex).mockResolvedValue({ result: 'Hello world!', models: [] })
   vi.mocked(api.installWhisper).mockResolvedValue({ status: 'installing' })
   vi.mocked(api.deleteFinishedJobs).mockResolvedValue({ deleted: 0, state: baseState })
@@ -132,7 +140,7 @@ describe('workspace flow', () => {
     await fireEvent.click(screen.getByRole('button', { name: '폴더 선택' }))
     await screen.findByRole('dialog')
     await fireEvent.click(screen.getByRole('button', { name: '현재 폴더 추가' }))
-    await screen.findByText('김: 안녕하세요')
+    await screen.findByDisplayValue('김: 안녕하세요')
     expect(screen.getByText('2개 파일')).toBeTruthy()
     await fireEvent.click(screen.getByRole('button', { name: 'a.srt 아래로' }))
     await fireEvent.click(screen.getByRole('button', { name: '회의록 정리 시작' }))
@@ -245,7 +253,8 @@ describe('workspace flow', () => {
     expect(await screen.findByTitle(srt)).toBeTruthy()
     expect(screen.getByTitle(media).closest('.cart-item')?.classList.contains('disabled')).toBe(true)
     expect(screen.getByText('전사 완료 · 회의록 처리 제외')).toBeTruthy()
-    expect(screen.getByText('1개 파일')).toBeTruthy()
+    expect(screen.getByText('2개 파일')).toBeTruthy()
+    expect(screen.getByText('1개 파일을 위에서 정한 순서대로 처리합니다.')).toBeTruthy()
     await fireEvent.click(screen.getByRole('button', { name: '회의록 정리 시작' }))
     await waitFor(() => expect(api.createJobs).toHaveBeenCalledWith([srt], 'gpt-5.6-sol', 'medium'))
   })
@@ -386,5 +395,52 @@ describe('workspace flow', () => {
     await waitFor(() => expect(screen.queryByText('old.mp4')).toBeNull())
     expect(screen.getByText('live.mp4')).toBeTruthy()
     expect(clear.disabled).toBe(true)
+  })
+})
+
+describe('retained processing list', () => {
+  const path = '/synthetic/meeting.srt'
+  function minutes(status: Job['status']): Job {
+    return { ...transcriptionJob(status), id: 'retained-minutes', kind: 'minutes', path, name: 'meeting.srt', transcriptionModel: undefined }
+  }
+  function seedCart() { localStorage.setItem('meet-to-md-cart-v1', JSON.stringify([{ path, name: 'meeting.srt' }])) }
+  it('keeps the selected preview and list after enqueue, blocks repeat submission, and offers rerun', async () => {
+    seedCart()
+    vi.mocked(api.createJobs).mockResolvedValue({ jobs: [minutes('queued')] })
+    render(App)
+    await screen.findByDisplayValue('김: 안녕하세요')
+    await screen.findByDisplayValue('한국어로 회의록 작성')
+    await fireEvent.click(screen.getByRole('button', { name: '회의록 정리 시작' }))
+    await waitFor(() => expect(api.createJobs).toHaveBeenCalledTimes(1))
+    expect(screen.getByDisplayValue('김: 안녕하세요')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'meeting.srt 삭제' })).toBeTruthy()
+    expect((screen.getByRole('button', { name: '회의록 정리 시작' }) as HTMLButtonElement).disabled).toBe(true)
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: [minutes('completed')] })
+    await fireEvent.click(await screen.findByRole('button', { name: '다시 정리' }))
+    await waitFor(() => expect(api.createJobs).toHaveBeenCalledTimes(2))
+  })
+  it('clears only the cart and ignores later transcription completion', async () => {
+    const media = '/synthetic/meeting.mp4'
+    localStorage.setItem('meet-to-md-cart-v1', JSON.stringify([{ path: media, name: 'meeting.mp4' }]))
+    const active = { ...transcriptionJob('running'), path: media, name: 'meeting.mp4' }
+    vi.mocked(api.state).mockResolvedValue({ ...baseState, jobs: [active] })
+    render(App)
+    await screen.findByRole('button', { name: 'meeting.mp4 삭제' })
+    await fireEvent.click(screen.getByRole('button', { name: '처리 순서 지우기' }))
+    expect(screen.queryByRole('button', { name: 'meeting.mp4 삭제' })).toBeNull()
+    expect(api.cancelJob).not.toHaveBeenCalled()
+    expect(api.deleteJob).not.toHaveBeenCalled()
+    FakeEventSource.latest.emit('state', { ...baseState, jobs: [{ ...active, status: 'completed', transcriptPath: '/synthetic/meeting_전사.srt' }] })
+    await waitFor(() => expect(localStorage.getItem('meet-to-md-cart-v1')).toBe('[]'))
+    expect(screen.queryByRole('button', { name: 'meeting_전사.srt 삭제' })).toBeNull()
+    expect((screen.getByRole('button', { name: '처리 순서 지우기' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+  it('shows storage errors and retains the working list', async () => {
+    seedCart()
+    render(App)
+    await screen.findByRole('button', { name: 'meeting.srt 삭제' })
+    FakeEventSource.latest.emit('state', { ...baseState, storageError: '작업 기록을 저장하지 못했습니다.' })
+    expect((await screen.findByRole('alert')).textContent).toContain('저장을 자동으로 다시 시도')
+    expect(screen.getByRole('button', { name: 'meeting.srt 삭제' })).toBeTruthy()
   })
 })

@@ -271,6 +271,8 @@ func (s *Service) recordTranscription(id string, event transcriptionEvent) {
 }
 
 func transcriptKey(path, model string) (string, error) {
+	// Cache ownership follows the canonical source path, size, timestamp and model.
+	// Recheck the key after transcription so edited inputs never reuse mismatched SRTs.
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err

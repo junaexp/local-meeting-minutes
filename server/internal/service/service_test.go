@@ -249,11 +249,11 @@ func TestDeleteFinishedKeepsActiveJobsAndResultFiles(t *testing.T) {
 		{ID: "queued", Status: "queued"},
 		{ID: "running", Status: "running"},
 	}
-	if err := s.persistLocked(); err != nil {
-		s.mu.Unlock()
+	s.revision++
+	s.mu.Unlock()
+	if err := s.persist(); err != nil {
 		t.Fatal(err)
 	}
-	s.mu.Unlock()
 
 	deleted, err := s.DeleteFinished()
 	if err != nil {
@@ -298,7 +298,7 @@ func TestUISnapshotKeepsLiveOutputAndSummarizesHistory(t *testing.T) {
 	if old := snapshot.Jobs[0]; old.Result != "" || old.RecentOutput != "" || old.TranscriptionLog != "" || old.TranscriptPreview != "" || old.Prompt != "" {
 		t.Fatalf("finished job still carries long text: %+v", old)
 	}
-	if live := snapshot.Jobs[50]; live.TranscriptionLog != "current log" || live.TranscriptPreview != "current preview" || live.Prompt != "current prompt" {
+	if live := snapshot.Jobs[50]; live.TranscriptionLog != "current log" || live.TranscriptPreview != "current preview" || live.Prompt != "" {
 		t.Fatalf("live output was removed: %+v", live)
 	}
 	if full, err := s.Job("old-0"); err != nil || full.Result != "large result" {
