@@ -2,6 +2,18 @@
 
 로컬 자막·텍스트·오디오 파일을 한 파일당 하나의 Markdown 회의록으로 만드는 웹서비스입니다. Go chi 서버가 파일과 작업 큐를 관리하고, Svelte/Vite UI가 진행 상태를 실시간으로 표시합니다. 회의록 본문은 로컬 Codex app-server가 생성합니다.
 
+## 화면 미리보기
+
+가상의 SRT 샘플을 넣어 실행한 화면입니다. 파일 선택부터 전사 설정, 회의록 저장까지 살펴볼 수 있습니다. 실제 회의 녹음이나 개인정보는 사용하지 않았습니다.
+
+| 파일 선택과 작업 목록 | SRT 미리보기와 작업 설정 |
+| --- | --- |
+| <img src="docs/screenshots/02-샘플파일과-저장결과.png" alt="가상 회의 SRT를 선택하고 결과 파일 위치를 확인하는 화면" width="480"> | <img src="docs/screenshots/03-SRT-미리보기와-작업설정.png" alt="SRT 전사문 미리보기와 프롬프트 및 모델 설정 화면" width="480"> |
+| 로컬 실행 환경 확인 | 회의록 생성 완료 |
+| <img src="docs/screenshots/04-로컬-실행환경-확인.png" alt="Codex와 Whisper 실행 파일 및 모델 경로를 확인하는 설정 화면" width="480"> | <img src="docs/screenshots/05-회의록-생성-완료.png" alt="완료 목록과 생성된 회의록 경로를 보여주는 화면" width="480"> |
+| 생성된 문서와 작업 로그 | 앱의 첫 화면 |
+| <img src="docs/screenshots/06-생성된-Markdown과-작업로그.png" alt="생성된 Markdown 회의록과 처리 로그 화면" width="480"> | <img src="docs/screenshots/01-초기화면.png" alt="meet-to-md의 입력, 미리보기, 프롬프트, 작업 큐 화면" width="480"> |
+
 ## 준비
 
 - Go 1.23 이상, Node.js 22 이상
